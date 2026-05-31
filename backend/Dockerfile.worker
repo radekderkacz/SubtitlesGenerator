@@ -1,0 +1,58 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Builder stage — install Python deps + fetch the static ffmpeg.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.12-slim AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        gcc \
+        libpq-dev \
+        curl \
+        xz-utils \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Static ffmpeg from johnvansickle.com — single ~85 MB self-contained binary
+# with libmp3lame, h264, h265, opus, vorbis, ac3, dts, vp9, av1, aac and the
+# rest of the codec set we need to read user movie containers + write a 16k
+# mono mp3 for the remote whisper endpoint. ~250 MB lighter than Debian's
+# `apt install ffmpeg` (which brings every libav-codec-extra Recommends).
+RUN curl -fsSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+    | tar -xJ -C /tmp && \
+    mv /tmp/ffmpeg-*-amd64-static/ffmpeg /tmp/ffmpeg && \
+    mv /tmp/ffmpeg-*-amd64-static/ffprobe /tmp/ffprobe
+
+# Install deps into a venv so the final stage copies a single self-contained dir.
+RUN python -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+
+COPY requirements/ /tmp/requirements/
+RUN pip install --no-cache-dir -r /tmp/requirements/worker.txt
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runtime stage — bare python:3.12-slim + static ffmpeg + the prepared venv.
+# No apt-ffmpeg (saves ~250 MB of libav-codec-extra), no gcc, no -dev packages.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC \
+    PATH=/opt/venv/bin:$PATH
+
+WORKDIR /app
+
+COPY --from=builder /tmp/ffmpeg /usr/local/bin/ffmpeg
+COPY --from=builder /tmp/ffprobe /usr/local/bin/ffprobe
+COPY --from=builder /opt/venv /opt/venv
+
+COPY app/ app/
+COPY alembic/ alembic/
+COPY alembic.ini alembic.ini
+
+COPY entrypoint.worker.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,0 +1,6 @@
+-r base.txt
+ffmpeg-python==0.2.0
+# litellm + whisperx removed May 2026 — the worker translates via httpx
+# directly and never imported litellm; local-WhisperX support was deleted
+# as part of the "remote backends only" refactor. See backend/Dockerfile.worker
+# for the size win.

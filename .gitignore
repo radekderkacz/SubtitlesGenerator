@@ -1,0 +1,57 @@
+# Worktrees
+.worktrees/
+worktrees/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Node
+node_modules/
+dist/
+.parcel-cache/
+
+# Environment
+.env
+.env.local
+
+# Data volumes (bind-mounted, not versioned)
+data/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Test and coverage artifacts
+backend/coverage.xml
+backend/.coverage
+frontend/coverage/
+playwright-report/
+test-results/
+
+# Python test cache
+.pytest_cache/
+htmlcov/
+.claude/scheduled_tasks.lock
+.coverage
+frontend/.coverage
+
+# Local assistant / planning / editor scratch — never published
+.claude/
+.superpowers/
+.dev/
+_bmad-output/
+*.pid

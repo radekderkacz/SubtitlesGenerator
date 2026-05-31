@@ -1,0 +1,72 @@
+# Dependabot configuration.
+#
+# Why this file exists: without it, only Dependabot *security-update* PRs are
+# opened (a repo-Settings toggle that needs no config). That left dependency
+# drift to accumulate silently as Security-tab alerts — 12 had piled up unseen
+# before PR #108. This adds grouped, scheduled *version*-update PRs so drift
+# surfaces proactively, one low-noise PR per ecosystem per week.
+#
+# Companion controls (in .github/workflows/pipeline.yml, not here):
+#   - `dependency-audit` job — fails any PR introducing a moderate+ vulnerable
+#     dependency (npm audit + pip-audit). The pre-merge gate; chosen over
+#     dependency-review-action, which needs paid Advanced Security on private
+#     repos. Runs with no secrets, so it works on Dependabot PRs.
+#   - SonarQube job skips Dependabot PRs (they get no repo secrets, so the
+#     scanner can't authenticate — every Dependabot PR was stuck red otherwise).
+#
+# Note: transitive-only CVEs that need a manual npm `overrides` / pip constraint
+# (e.g. the shadcn -> hono chain fixed in PR #108) cannot be auto-authored by
+# Dependabot — those still require a human to add the override.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/backend/requirements"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+    open-pull-requests-limit: 10
+    groups:
+      backend-python:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+    open-pull-requests-limit: 10
+    groups:
+      frontend-npm:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+
+  - package-ecosystem: "docker"
+    directory: "/backend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+    groups:
+      docker:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(ci)"

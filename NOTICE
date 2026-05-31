@@ -1,0 +1,56 @@
+SubtitlesGenerator
+Copyright 2026 Radek Derkacz
+
+This product is licensed under the Apache License, Version 2.0 (the "License");
+you may not use this software except in compliance with the License. A copy of
+the License is provided in the LICENSE file in this repository, or at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+================================================================================
+Third-party components
+================================================================================
+
+This repository's own source code is licensed under Apache-2.0. The application
+depends on, and its container images bundle, third-party software under their
+own licenses. The notable ones are listed below; see each project's own
+distribution for the authoritative license text.
+
+--------------------------------------------------------------------------------
+FFmpeg (bundled binary in the worker image) — GPL v3
+--------------------------------------------------------------------------------
+
+The worker container image (backend/Dockerfile.worker) bundles a static FFmpeg
+build obtained from https://johnvansickle.com/ffmpeg/. That build is licensed
+under the GNU General Public License, version 3 (GPLv3), and includes GPL-licensed
+components.
+
+FFmpeg is invoked by this application as a separate executable (a subprocess);
+it is not linked into the application's code. The inclusion of the FFmpeg binary
+in the distributed image is "mere aggregation" and does not place the rest of
+this product under the GPL. The Apache-2.0 license above applies only to the
+source code in this repository.
+
+Anyone redistributing the worker image must comply with the GPLv3 for the FFmpeg
+component, including making the corresponding source available. The build and its
+matching source are published at https://johnvansickle.com/ffmpeg/ . Upstream
+FFmpeg source: https://ffmpeg.org/download.html . GPLv3 text:
+https://www.gnu.org/licenses/gpl-3.0.html
+
+--------------------------------------------------------------------------------
+Python dependencies
+--------------------------------------------------------------------------------
+
+All runtime Python dependencies are distributed under permissive licenses
+(MIT, BSD, or Apache-2.0): FastAPI, Starlette, sse-starlette, aiofiles,
+Pydantic, Uvicorn, Celery, redis-py, SQLAlchemy, asyncpg, Alembic, HTTPX,
+watchdog, croniter, ffmpeg-python. See backend/requirements/ for exact versions.
+
+--------------------------------------------------------------------------------
+JavaScript / frontend dependencies
+--------------------------------------------------------------------------------
+
+Frontend dependencies are distributed under permissive licenses (predominantly
+MIT, with ISC, BSD, and Apache-2.0). The build toolchain includes lightningcss,
+which is licensed under MPL-2.0 and is used unmodified at build time. See
+frontend/package.json for the dependency list.

@@ -1,0 +1,137 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SubtitlesGenerator — self-hosted subtitle pipeline
+#
+# What this stack runs (left → right of the dependency arrow):
+#
+#   app    ── FastAPI + the React SPA. Migrations run on startup.
+#             Listens on :8000. Open http://<host>:8000 to use the app.
+#   worker ── Celery worker. Picks up jobs, calls your remote Whisper
+#             endpoint to transcribe, your translation provider to translate,
+#             writes the .srt next to the source video.
+#   beat   ── Celery scheduler. Fires cron-triggered jobs from the
+#             Automations workspace. Same image as the worker, different
+#             entrypoint.
+#   redis  ── Broker between app and worker, plus pub-sub for live UI updates.
+#   db     ── Postgres. Persists settings, jobs, automation triggers.
+#
+# What it does NOT include:
+#   * a Whisper server   — point `transcription_api_url` (Settings → AI
+#                          Backends) at any OpenAI-compatible /v1/audio/
+#                          transcriptions endpoint (faster-whisper-server,
+#                          speaches, Groq, OpenAI).
+#   * a translator       — point `translation_*` settings at Ollama / OpenAI /
+#                          OpenRouter / Anthropic / Google Translate.
+#   * Jellyfin           — optional; if configured, the app POSTs a library
+#                          refresh after each completed job.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  app:
+    image: ghcr.io/radekderkacz/subtitles-generator-app:latest
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://subtitles:${DB_PASSWORD}@db:5432/subtitles
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+    volumes:
+      # Per-job logs (created on demand by the worker; here for `docker logs`-
+      # less inspection via the host).
+      - ./data/logs:/app/logs
+      # Your media library, read-only for the app (the UI browses paths to
+      # build job submissions; it never writes anything).
+      #
+      # LEFT side of the colon  = path on YOUR docker host (the machine
+      #                            running compose). Set MEDIA_HOST_PATH
+      #                            in .env to wherever your videos live.
+      # RIGHT side of the colon = path INSIDE the container; keep it as
+      #                            `/media`. This is the path that Settings →
+      #                            Media Library expects (and defaults to).
+      - ${MEDIA_HOST_PATH}:/media:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/v1/health > /dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  worker:
+    image: ghcr.io/radekderkacz/subtitles-generator-worker:latest
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://subtitles:${DB_PASSWORD}@db:5432/subtitles
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    volumes:
+      - ./data/logs:/app/logs
+      # Same library mount as the app — but READ-WRITE here, because the
+      # worker writes the .srt file sibling to the source .mkv. Make sure
+      # the host path is on a filesystem the worker process can write to.
+      - ${MEDIA_HOST_PATH}:/media
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    # Don't SIGKILL the worker mid-transcription on `compose down` / re-pull —
+    # a remote Whisper call can take minutes. 90 s gives Celery's warm
+    # shutdown a chance to either finish the in-flight task or cleanly reject
+    # it back to the broker for re-delivery on the next boot.
+    stop_grace_period: 90s
+
+  beat:
+    image: ghcr.io/radekderkacz/subtitles-generator-worker:latest
+    # IMPORTANT: the worker image's ENTRYPOINT is `/entrypoint.sh` which
+    # hardcodes `exec celery worker`. Docker passes `command:` as arguments
+    # to the ENTRYPOINT — and entrypoint.sh ignores its arguments. Without
+    # this `entrypoint:` override, the beat container would silently run as
+    # a second worker (and no cron scheduler would be running at all). We
+    # have a static invariant in the test suite that fails CI if this gets
+    # removed; don't remove it.
+    entrypoint: ["celery", "-A", "app.worker.celery_app.celery_app", "beat", "-l", "info"]
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://subtitles:${DB_PASSWORD}@db:5432/subtitles
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      - POSTGRES_DB=subtitles
+      - POSTGRES_USER=subtitles
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+    volumes:
+      # Bind-mount so backups / inspection are easy from the host. Use a
+      # named volume here instead if you prefer Docker-managed storage.
+      - ./data/postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U subtitles -d subtitles"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
