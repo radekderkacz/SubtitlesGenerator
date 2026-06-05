@@ -1,4 +1,4 @@
-"""Watchdog file watcher service.
+"""Watchdog file watcher service
 
 Wraps `watchdog.observers.Observer` to monitor configured NAS folders and
 auto-enqueue subtitle jobs for newly detected video files. The watchdog

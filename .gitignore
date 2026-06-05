@@ -45,7 +45,6 @@ test-results/
 # Python test cache
 .pytest_cache/
 htmlcov/
-.claude/scheduled_tasks.lock
 .coverage
 frontend/.coverage
 
