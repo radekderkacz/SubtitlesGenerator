@@ -151,6 +151,22 @@ docker compose up -d
 
 The app container runs `alembic upgrade head` on boot, so schema migrations apply automatically.
 
+### Pinning to a release
+
+`docker-compose.yml` tracks `:latest` so a `docker compose pull` always gets the newest build. For a reproducible deployment, pin both images to a release version instead — the tag matches the version shown in the app's sidebar:
+
+```yaml
+# docker-compose.yml
+  app:
+    image: ghcr.io/radekderkacz/subtitles-generator-app:0.1.0
+  worker:
+    image: ghcr.io/radekderkacz/subtitles-generator-worker:0.1.0
+  beat:
+    image: ghcr.io/radekderkacz/subtitles-generator-worker:0.1.0
+```
+
+Every build is also tagged with its commit SHA if you need to pin even more precisely.
+
 ---
 
 ## Troubleshooting

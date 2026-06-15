@@ -29,6 +29,9 @@ export default function Sidebar(_props: Props) {
           SubtitlesGen
         </h1>
         <p className="text-xs text-muted-foreground mt-1">by Derkos Labs</p>
+        <p className="text-[10px] text-muted-foreground/70 mt-0.5 font-medium tracking-wider">
+          v{__APP_VERSION__}
+        </p>
       </div>
 
       {/* Navigation */}

@@ -9,6 +9,11 @@ RUN npm run build
 # Stage 2: Python app
 FROM python:3.12-slim
 
+# OCI metadata — GHCR auto-links the package to this repo via the source label
+LABEL org.opencontainers.image.source="https://github.com/radekderkacz/SubtitlesGenerator" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.description="SubtitlesGenerator app — FastAPI backend + built React UI"
+
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=UTC
 

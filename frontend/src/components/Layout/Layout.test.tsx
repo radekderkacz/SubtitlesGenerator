@@ -44,6 +44,7 @@ describe('Layout', () => {
     renderWithRouter()
     expect(screen.getByText('SubtitlesGen')).toBeInTheDocument()
     expect(screen.getByText('by Derkos Labs')).toBeInTheDocument()
+    expect(screen.getByText(/^v\d+\.\d+\.\d+/)).toBeInTheDocument()
   })
 
   it('renders all five nav links including Library and Automations', () => {
