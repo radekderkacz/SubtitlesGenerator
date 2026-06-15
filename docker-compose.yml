@@ -62,6 +62,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+    labels:
+      # Watchtower auto-updates this service when a new :latest digest is
+      # published. (Only consulted when Watchtower runs in --label-enable mode;
+      # in its default mode every container is updated regardless.)
+      - "com.centurylinklabs.watchtower.enable=true"
 
   worker:
     image: ghcr.io/radekderkacz/subtitles-generator-worker:latest
@@ -87,6 +92,13 @@ services:
     # shutdown a chance to either finish the in-flight task or cleanly reject
     # it back to the broker for re-delivery on the next boot.
     stop_grace_period: 90s
+    labels:
+      # Auto-updated by Watchtower. IMPORTANT: Watchtower stops containers with
+      # its own WATCHTOWER_TIMEOUT (default 10s) and ignores the 90s
+      # stop_grace_period above — set WATCHTOWER_TIMEOUT=120 on the Watchtower
+      # container so an in-flight transcription is allowed to finish/requeue
+      # instead of being SIGKILLed mid-job.
+      - "com.centurylinklabs.watchtower.enable=true"
 
   beat:
     image: ghcr.io/radekderkacz/subtitles-generator-worker:latest
@@ -109,10 +121,16 @@ services:
       db:
         condition: service_healthy
     restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
 
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    labels:
+      # Data/infra service — excluded from Watchtower so the broker isn't
+      # recreated out from under in-flight jobs on an unrelated image bump.
+      - "com.centurylinklabs.watchtower.enable=false"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -130,6 +148,10 @@ services:
       # named volume here instead if you prefer Docker-managed storage.
       - ./data/postgres:/var/lib/postgresql/data
     restart: unless-stopped
+    labels:
+      # Data service — excluded from Watchtower; never auto-recreate the
+      # database container on an image bump. Upgrade Postgres deliberately.
+      - "com.centurylinklabs.watchtower.enable=false"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U subtitles -d subtitles"]
       interval: 10s

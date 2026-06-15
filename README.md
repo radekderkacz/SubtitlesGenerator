@@ -151,6 +151,37 @@ docker compose up -d
 
 The app container runs `alembic upgrade head` on boot, so schema migrations apply automatically.
 
+### Automatic updates with Watchtower (optional)
+
+The `app`, `worker`, and `beat` services run on `:latest` and carry
+`com.centurylinklabs.watchtower.enable=true`; `db` and `redis` carry
+`...enable=false`. So if you run [Watchtower](https://containrrr.dev/watchtower/),
+it will auto-pull and recreate the three application containers when a new
+release is published, and leave your database and broker alone.
+
+```yaml
+# add to docker-compose.yml, or run as a standalone container
+  watchtower:
+    image: containrrr/watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # Honour the worker's long shutdown so an in-flight transcription can
+      # finish or requeue instead of being killed mid-job.
+      - WATCHTOWER_TIMEOUT=120
+      - WATCHTOWER_CLEANUP=true          # remove the old image after updating
+      - WATCHTOWER_LABEL_ENABLE=true     # only touch services labelled enable=true
+    restart: unless-stopped
+```
+
+Notes:
+- Keep the services on `:latest` — Watchtower only updates moving tags. If you
+  [pin to a release](#pinning-to-a-release), Watchtower won't (and shouldn't) update it.
+- `WATCHTOWER_TIMEOUT=120` matters: Watchtower ignores compose `stop_grace_period`
+  and uses this value before SIGKILL. The default 10s can kill a running transcription.
+- Without `WATCHTOWER_LABEL_ENABLE=true`, Watchtower updates **every** container
+  it can see; the `enable=false` labels on `db`/`redis` still protect those two.
+
 ### Pinning to a release
 
 `docker-compose.yml` tracks `:latest` so a `docker compose pull` always gets the newest build. For a reproducible deployment, pin both images to a release version instead — the tag matches the version shown in the app's sidebar:
