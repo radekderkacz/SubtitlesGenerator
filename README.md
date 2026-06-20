@@ -1,22 +1,98 @@
 # SubtitlesGen
 
-A self-hosted subtitle pipeline for your media library. Drop a movie in a folder, get back a transcribed and translated `.srt` next to the original — either on-demand from the UI, automatically when a new file appears, or on a schedule.
+**Automatic subtitles for your movies and TV shows.** Drop a video into a folder and SubtitlesGen transcribes it — and optionally translates it — into a `.srt` subtitle file saved right next to the video, ready for Jellyfin, Plex, or any player.
 
-- **Transcription** is delegated to any OpenAI-compatible `/v1/audio/transcriptions` endpoint — self-host [faster-whisper-server](https://github.com/fedirz/faster-whisper-server) or [speaches](https://github.com/speaches-ai/speaches), or use a hosted provider (Groq, OpenAI).
-- **Translation** is delegated to your choice of provider — Ollama (self-hosted), OpenAI, OpenRouter, Anthropic, or Google Translate.
-- **Speech-aligned timing** — output is re-segmented into sentence-level, reading-speed-bounded, line-wrapped cues (not a raw one-cue-per-segment dump), so subtitles appear when they're spoken.
-- **Quality verification** — every completed job is automatically checked: structural validity (timing, coverage), hallucination heuristics (repeat loops, artifacts), and an optional LLM coherence/faithfulness judge. You get a pass / warn / fail verdict per job, with a report and a one-click re-verify. It never blocks output — it's a signal.
-- **Jellyfin** integration is optional — if configured, a library refresh is triggered after every completed job so the new subtitle track appears immediately.
+It runs as a few small Docker containers on your own machine. **No GPU required.**
 
-The app itself is the orchestrator: a FastAPI backend, a React UI, a Celery worker, and Postgres + Redis. No GPU required on the docker host (your Whisper server does the heavy lifting wherever it lives).
+## What it does
 
-## Screenshots
-
-_(coming soon — Queue, Automations, Settings)_
+- **Transcribes** speech in your videos into subtitles, automatically.
+- **Translates** them into another language (optional).
+- **Times them properly** — short, sentence-level lines that show up *when they're actually spoken*, wrapped to a comfortable length.
+- **Checks its own work** — every finished job gets a pass / warn / fail quality check (with a one-click re-check) so you know which subtitles are worth reviewing. It never blocks output; it's just a heads-up.
+- **Runs three ways** — on demand from the web UI, automatically when a new video appears, or on a schedule.
+- **Refreshes Jellyfin** for you (optional) so new subtitles appear right away.
 
 ---
 
-## Architecture
+## What you'll need
+
+- **Docker**, with the `docker compose` command.
+- A **folder of videos** on the machine.
+- A **transcription service** and (if you want translations) a **translation service**.
+
+> ⚠️ **Important:** SubtitlesGen is the *coordinator* — it does **not** include the AI itself. You point it at a transcription service (the thing that turns speech into text) and a translation service. You can:
+> - **self-host free ones** — e.g. [faster-whisper-server](https://github.com/fedirz/faster-whisper-server) or [speaches](https://github.com/speaches-ai/speaches) for transcription, and [Ollama](https://ollama.com/) for translation, or
+> - **use a paid API** — OpenAI, Groq, OpenRouter, Anthropic, or Google.
+>
+> You enter these in the app's **Settings** after installing (next section). Nothing to configure up front.
+
+---
+
+## Install (about 5 minutes)
+
+```bash
+mkdir subtitlesgen && cd subtitlesgen
+
+# 1. Grab the compose file and the environment template
+curl -O https://raw.githubusercontent.com/radekderkacz/SubtitlesGenerator/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/radekderkacz/SubtitlesGenerator/main/.env.example
+mv .env.example .env
+
+# 2. Edit .env — set MEDIA_HOST_PATH to your video folder, and pick passwords
+$EDITOR .env
+
+# 3. Create the data folders, then start it
+mkdir -p data/logs data/postgres
+docker compose up -d
+```
+
+Now open **<http://localhost:8000>**. (First start pulls the images and sets up the database — give it a minute.)
+
+---
+
+## First run — connect your services
+
+In the app, go to **Settings** and:
+
+1. **Media Library** — confirm the video path. With the default setup it's `/media`.
+2. **AI Backends → Transcription** — paste your transcription service's URL + model name (+ API key if it needs one), then click **Test Connection**.
+3. **AI Backends → Translation** — pick your provider, fill in the URL/key, click **Test Connection**.
+4. **Profiles** — save your transcription + translation choices as a named profile so you can pick it per job.
+5. *(optional)* **Jellyfin** — add its URL + API key and **Test Connection**.
+
+Then open **Library**, pick a video, and hit **Submit**. The subtitle file appears next to your video when it's done. 🎬
+
+---
+
+## Updating
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+The app applies any database changes automatically on start. (Prefer a fixed version, or hands-off auto-updates? See **Advanced** below.)
+
+---
+
+## Common problems
+
+- **"Directory not found" / can't see my videos** — make sure `MEDIA_HOST_PATH` in `.env` points at your real video folder, and that **Settings → Media Library** is set to `/media` (the path *inside* the container).
+- **Settings → Test Connection fails** — your transcription/translation service must be reachable from the containers. Quick check: `docker compose exec worker curl <your-service-url>`.
+- **A job is stuck "queued"** — check the containers are healthy with `docker compose ps`.
+- **Jellyfin didn't refresh** — confirm the Jellyfin URL + API key in Settings, and that the API key's user has permission to refresh libraries.
+
+For anything else, open an issue: <https://github.com/radekderkacz/SubtitlesGenerator/issues>
+
+---
+
+## Advanced &amp; reference
+
+<details>
+<summary><b>How it works (architecture)</b></summary>
+
+The app is the orchestrator: a FastAPI backend, a React UI, a Celery worker, and Postgres + Redis. No GPU on the Docker host — your transcription server does the heavy lifting wherever it lives.
 
 ```
                             ┌─────────────┐
@@ -44,72 +120,28 @@ _(coming soon — Queue, Automations, Settings)_
                                                        (you run)   (you pick)
 ```
 
-The single source of truth for what runs is [`docker-compose.yml`](docker-compose.yml) — go read it; the inline comments explain every service.
+The single source of truth for what runs is [`docker-compose.yml`](docker-compose.yml) — the inline comments explain every service.
 
----
+</details>
 
-## Quick start
+<details>
+<summary><b>Configuration: UI vs. environment variables</b></summary>
 
-### Prerequisites
+The compose file needs only three env vars (`MEDIA_HOST_PATH`, `DB_PASSWORD`, `SECRET_KEY`). **Everything else lives in the database and is set at runtime via the web UI** — connection strings, API keys, profiles, watch triggers, cron schedules belong in the running app, not in host env vars.
 
-- Docker + docker compose plugin
-- A directory on the host with your videos in it
-- An OpenAI-compatible Whisper endpoint reachable from the worker container
-- _(optional)_ A Jellyfin instance
-- _(optional)_ A translation backend (Ollama, OpenAI key, etc.)
-
-### Spin it up
-
-```bash
-mkdir subtitles-generator && cd subtitles-generator
-
-# Grab the compose file and env template
-curl -O https://raw.githubusercontent.com/radekderkacz/SubtitlesGenerator/main/docker-compose.yml
-curl -O https://raw.githubusercontent.com/radekderkacz/SubtitlesGenerator/main/.env.example
-mv .env.example .env
-
-# Edit .env — set MEDIA_HOST_PATH to your video library, set passwords
-$EDITOR .env
-
-# Create the bind-mount directories so they exist before compose starts
-mkdir -p data/logs data/postgres
-
-# Pull and start
-docker compose pull
-docker compose up -d
-
-# Tail the app logs until you see "Uvicorn running on http://0.0.0.0:8000"
-docker compose logs -f app
-```
-
-Then open <http://localhost:8000> and walk through Settings:
-
-1. **Media Library** — set the container path. If you used the default `MEDIA_HOST_PATH` mapping it's `/media`.
-2. **AI Backends → Transcription Engine** — paste your Whisper endpoint URL, model name, and (optional) API key. Click **Test Connection**.
-3. **AI Backends → Translation Provider** — pick a provider, fill in the URL/key, **Test Connection**.
-4. **Saved Configurations** — name a profile snapshotting steps 2 + 3 so you can pick it per-job.
-5. _(optional)_ **Jellyfin** — URL + API key, **Test Connection**.
-
-You're ready: open **Library**, pick a video, **Submit**.
-
----
-
-## Configuration via the UI vs. via env
-
-The compose file requires three env vars (`MEDIA_HOST_PATH`, `DB_PASSWORD`, `SECRET_KEY`) and nothing else. **Everything else lives in the database and is configured at runtime via the web UI.** That's deliberate: connection strings, API keys, profiles, watch triggers, cron schedules — they belong in the running app, not in environment variables on the host.
-
-If you want to script the initial setup (e.g. ansible, terraform), hit the REST API directly:
+To script the initial setup (ansible, terraform, etc.), hit the REST API directly:
 
 ```
 POST /api/v1/settings        — set jellyfin URL, transcription URL, etc.
 POST /api/v1/triggers        — create a watch folder or cron job
 ```
 
-The OpenAPI doc is at `/docs` once the app is running.
+The OpenAPI docs are at `/docs` once the app is running.
 
----
+</details>
 
-## What goes where on disk
+<details>
+<summary><b>What goes where on disk</b></summary>
 
 | Path inside container | What's there |
 |---|---|
@@ -117,49 +149,37 @@ The OpenAPI doc is at `/docs` once the app is running.
 | `/app/logs/<job-id>.log` | Per-job pipeline log. Bind-mounted to `./data/logs/` on the host. |
 | `/var/lib/postgresql/data` | Postgres data dir. Bind-mounted to `./data/postgres/` on the host. |
 
----
+</details>
 
-## Operational notes
+<details>
+<summary><b>Operational notes</b></summary>
 
-- **The worker child respawns after every task** (`worker_max_tasks_per_child=1`). This is intentional — long-running pipeline tasks tend to accumulate per-process state (open file handles, HTTP pools, ffmpeg subprocess remnants). Fork cost is sub-second on the slim worker image; transcription tasks run for minutes, so the overhead is invisible. See [`backend/app/worker/celery_app.py`](backend/app/worker/celery_app.py) for the rationale.
-- **Subtitles are written sibling to the source video** with naming `<basename>.<lang>.srt` (e.g. `MyMovie.pl.srt`). This is the convention Jellyfin and Plex auto-detect.
-- **On every completed job the worker POSTs to Jellyfin's `/Library/Refresh`** if a Jellyfin URL is configured. The new subtitle track appears within seconds.
+- **The worker child respawns after every task** (`worker_max_tasks_per_child=1`). Intentional — long pipeline tasks accumulate per-process state (file handles, HTTP pools, ffmpeg remnants). Fork cost is sub-second on the slim worker image; transcription runs for minutes, so the overhead is invisible. See [`backend/app/worker/celery_app.py`](backend/app/worker/celery_app.py).
+- **Subtitles are written sibling to the source video** as `<basename>.<lang>.srt` (e.g. `MyMovie.pl.srt`) — the convention Jellyfin and Plex auto-detect.
+- **On every completed job the worker POSTs to Jellyfin's `/Library/Refresh`** if a Jellyfin URL is configured; the new track appears within seconds.
 - **The Automations workspace** (sidebar → Sparkles icon) lets you create:
-  - **Watch triggers** — fire when a new video appears under a folder. The poll interval is 15 s (works on NFS where inotify doesn't).
+  - **Watch triggers** — fire when a new video appears under a folder (15 s poll; works on NFS where inotify doesn't).
   - **Scheduled scans** — cron-style sweep of a folder, dispatching anything without an existing `.srt`.
-  - **Webhooks** — POST a file path to a signed URL, get a job back. Useful for integrating with Sonarr/Radarr post-download hooks.
+  - **Webhooks** — POST a file path to a signed URL, get a job back. Handy for Sonarr/Radarr post-download hooks.
 
----
+</details>
 
-## Image sizes
-
-Both images are slim and pulled fast:
+<details>
+<summary><b>Image sizes</b></summary>
 
 | Image | Size |
 |---|---|
 | `ghcr.io/radekderkacz/subtitles-generator-app:latest` | ~620 MB |
 | `ghcr.io/radekderkacz/subtitles-generator-worker:latest` | ~566 MB |
 
-The worker image is a `python:3.12-slim` base + a static [`ffmpeg`](https://johnvansickle.com/ffmpeg/) binary with all common codecs (H.264, HEVC, AAC, AC-3, DTS, Opus, Vorbis, FLAC, TrueHD, VP9, AV1) + the Python deps. No CUDA, no torch, no whisperx — the heavy ML stack lives in your remote transcription server, wherever you run it.
+The worker image is `python:3.12-slim` + a static [`ffmpeg`](https://johnvansickle.com/ffmpeg/) binary with all common codecs (H.264, HEVC, AAC, AC-3, DTS, Opus, Vorbis, FLAC, TrueHD, VP9, AV1) + the Python deps. No CUDA, no torch — the heavy ML stack lives in your remote transcription server.
 
----
+</details>
 
-## Updating
+<details>
+<summary><b>Automatic updates with Watchtower</b></summary>
 
-```bash
-docker compose pull
-docker compose up -d
-```
-
-The app container runs `alembic upgrade head` on boot, so schema migrations apply automatically.
-
-### Automatic updates with Watchtower (optional)
-
-The `app`, `worker`, and `beat` services run on `:latest` and carry
-`com.centurylinklabs.watchtower.enable=true`; `db` and `redis` carry
-`...enable=false`. So if you run [Watchtower](https://containrrr.dev/watchtower/),
-it will auto-pull and recreate the three application containers when a new
-release is published, and leave your database and broker alone.
+The `app`, `worker`, and `beat` services run on `:latest` and carry `com.centurylinklabs.watchtower.enable=true`; `db` and `redis` carry `...enable=false`. So [Watchtower](https://containrrr.dev/watchtower/) will auto-update the three application containers and leave your database and broker alone.
 
 ```yaml
 # add to docker-compose.yml, or run as a standalone container
@@ -176,40 +196,30 @@ release is published, and leave your database and broker alone.
     restart: unless-stopped
 ```
 
-Notes:
-- Keep the services on `:latest` — Watchtower only updates moving tags. If you
-  [pin to a release](#pinning-to-a-release), Watchtower won't (and shouldn't) update it.
-- `WATCHTOWER_TIMEOUT=120` matters: Watchtower ignores compose `stop_grace_period`
-  and uses this value before SIGKILL. The default 10s can kill a running transcription.
-- Without `WATCHTOWER_LABEL_ENABLE=true`, Watchtower updates **every** container
-  it can see; the `enable=false` labels on `db`/`redis` still protect those two.
+- Keep the services on `:latest` — Watchtower only updates moving tags. If you pin to a release, Watchtower won't (and shouldn't) update it.
+- `WATCHTOWER_TIMEOUT=120` matters: Watchtower ignores compose `stop_grace_period` and uses this value before SIGKILL. The default 10s can kill a running transcription.
+- Without `WATCHTOWER_LABEL_ENABLE=true`, Watchtower updates **every** container it can see; the `enable=false` labels on `db`/`redis` still protect those two.
 
-### Pinning to a release
+</details>
 
-`docker-compose.yml` tracks `:latest` so a `docker compose pull` always gets the newest build. For a reproducible deployment, pin both images to a release version instead — the tag matches the version shown in the app's sidebar:
+<details>
+<summary><b>Pinning to a specific release</b></summary>
+
+`docker-compose.yml` tracks `:latest`. For a reproducible deployment, pin both images to a version instead — the tag matches the version shown in the app's sidebar:
 
 ```yaml
 # docker-compose.yml
   app:
-    image: ghcr.io/radekderkacz/subtitles-generator-app:0.1.0
+    image: ghcr.io/radekderkacz/subtitles-generator-app:0.2.0
   worker:
-    image: ghcr.io/radekderkacz/subtitles-generator-worker:0.1.0
+    image: ghcr.io/radekderkacz/subtitles-generator-worker:0.2.0
   beat:
-    image: ghcr.io/radekderkacz/subtitles-generator-worker:0.1.0
+    image: ghcr.io/radekderkacz/subtitles-generator-worker:0.2.0
 ```
 
-Every build is also tagged with its commit SHA if you need to pin even more precisely.
+Every build is also tagged with its commit SHA for even more precise pinning.
 
----
-
-## Troubleshooting
-
-- **Worker idle, jobs queued forever** — check the beat container's `ENTRYPOINT` is overridden to `celery beat` and not silently running as a second worker. See [`docker-compose.yml`](docker-compose.yml).
-- **`ffmpeg: No such file or directory` on extracting** — check `MEDIA_HOST_PATH` is actually mounted on the docker host AND your Settings → Media Library path matches the container path (`/media` by default).
-- **Settings → AI Backends → Test Connection fails** — verify the worker container can reach your Whisper server. `docker compose exec worker curl http://<your-whisper>:9000/health`.
-- **Jellyfin not refreshing after a job** — confirm the Jellyfin URL + API key in Settings, and that the user the API key belongs to has admin rights to refresh libraries.
-
-For anything else, open an issue at <https://github.com/radekderkacz/SubtitlesGenerator/issues>.
+</details>
 
 ---
 
@@ -217,8 +227,4 @@ For anything else, open an issue at <https://github.com/radekderkacz/SubtitlesGe
 
 Apache-2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
-The worker image bundles a static [FFmpeg](https://johnvansickle.com/ffmpeg/)
-binary licensed under GPLv3. FFmpeg runs as a separate executable and is not
-linked into this project's code, so it does not affect the Apache-2.0 licensing
-of the source. Redistributors of the image must comply with the GPLv3 for the
-FFmpeg component — see [`NOTICE`](NOTICE) for details.
+The worker image bundles a static [FFmpeg](https://johnvansickle.com/ffmpeg/) binary licensed under GPLv3. FFmpeg runs as a separate executable and is not linked into this project's code, so it does not affect the Apache-2.0 licensing of the source. Redistributors of the image must comply with the GPLv3 for the FFmpeg component — see [`NOTICE`](NOTICE) for details.
