@@ -47,6 +47,21 @@ async def test_browse_returns_422_when_nas_not_configured(client):
 
 
 @pytest.mark.asyncio
+async def test_browse_returns_actionable_error_when_configured_root_missing(tmp_path, client):
+    """Configured NAS root itself doesn't exist in the container (e.g. a stale
+    /shared after the mount moved to /media) → a clear, actionable 422 naming
+    the path and /media, not a generic 'Directory not found'."""
+    missing_root = tmp_path / "shared"  # never created
+    app.dependency_overrides[get_db] = _override_db_with_settings(_settings(str(missing_root)))
+    response = await client.get("/api/v1/files/browse")
+    assert response.status_code == 422
+    body = response.json()
+    assert body["code"] == "NAS_ROOT_MISSING"
+    assert "/media" in body["detail"]
+    assert str(missing_root) in body["detail"]
+
+
+@pytest.mark.asyncio
 async def test_browse_root_when_no_path_given(tmp_path, client):
     """No `path` param → list the configured nas_mount_path itself."""
     (tmp_path / "Film.mkv").write_bytes(b"x" * 10)

@@ -4,7 +4,10 @@ WORKDIR /frontend
 COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend/ ./
-RUN npm run build
+# CI passes the build commit so the sidebar version reads e.g. 0.2.0+48d9549.
+# Empty by default (local builds show the plain release version).
+ARG APP_BUILD_SHA=""
+RUN APP_BUILD_SHA="$APP_BUILD_SHA" npm run build
 
 # Stage 2: Python app
 FROM python:3.12-slim

@@ -34,7 +34,7 @@ def test_remote_transcription_500_then_200_succeeds_no_rerun(monkeypatch):
     monkeypatch.setattr(tasks.httpx, "Client", lambda **k: _ctx(client))
     monkeypatch.setattr(tasks, "_wait_remote_ready", lambda url, **k: None)
     out = tasks._run_transcription_remote_blocking("/a.wav", "http://w", "large-v3", None)
-    assert out == {"language": "en", "segments": []}
+    assert out == {"language": "en", "segments": [], "words": []}
     assert calls["n"] == 2  # retried the POST, no pipeline rerun
 
 def test_remote_transcription_persistent_500_raises_TPE(monkeypatch):

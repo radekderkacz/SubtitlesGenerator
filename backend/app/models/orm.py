@@ -55,6 +55,13 @@ class Job(Base):
     jellyfin_refreshed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Subtitle verification (post-completion, best-effort)
+    verification_status: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    verification_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    verification_report: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    verified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class Settings(Base):

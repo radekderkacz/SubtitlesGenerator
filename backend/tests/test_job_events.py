@@ -57,6 +57,11 @@ def test_build_payload_includes_all_required_fields():
         # failure without a follow-up GET /jobs/{id} round-trip.
         "file_path",
         "error_message",
+        # subtitle verification — surfaced so the live badge updates over SSE.
+        "verification_status",
+        "verification_score",
+        "verification_report",
+        "verified_at",
     }
     assert payload["status"] == "processing"
     assert payload["phase"] == "transcribing"

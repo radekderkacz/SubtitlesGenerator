@@ -8,6 +8,8 @@ export const JOB_STATUS = {
 
 export type JobStatus = (typeof JOB_STATUS)[keyof typeof JOB_STATUS]
 
+export type VerificationStatus = 'running' | 'pass' | 'warn' | 'fail' | 'skipped' | 'error'
+
 const ACTIVE_STATUSES: ReadonlySet<JobStatus> = new Set([
   JOB_STATUS.QUEUED,
   JOB_STATUS.PROCESSING,
@@ -45,6 +47,10 @@ export type Job = {
   updated_at: string
   completed_at: string | null
   jellyfin_refreshed_at: string | null
+  verification_status: VerificationStatus | null
+  verification_score: number | null
+  verification_report: { summary: string; checks: Array<{ layer: string; name: string; severity: string; detail: string }> } | null
+  verified_at: string | null
 }
 
 export type JobUpdatePayload = Pick<
@@ -55,6 +61,11 @@ export type JobUpdatePayload = Pick<
   // extra fetch. Optional because non-failure updates omit them.
   file_path?: string | null
   error_message?: string | null
+  // Verification fields — present on verification events, absent on others.
+  verification_status?: VerificationStatus | null
+  verification_score?: number | null
+  verification_report?: { summary: string; checks: Array<{ layer: string; name: string; severity: string; detail: string }> } | null
+  verified_at?: string | null
 }
 
 export type QueueStatePayload = {
@@ -130,6 +141,8 @@ export type HistoryEntry = {
   updated_at: string
   completed_at: string | null
   jellyfin_refreshed_at: string | null
+  verification_status: VerificationStatus | null
+  verification_score: number | null
 }
 
 export type HistoryDeleteResponse = {

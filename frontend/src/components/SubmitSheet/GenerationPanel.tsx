@@ -126,9 +126,10 @@ export default function GenerationPanel({ file, fullPath }: Props) {
             profiles={profiles}
             onChange={onChange}
           />
-        </div>
 
-        <footer className="p-6 border-t border-border bg-popover">
+          {/* Primary CTA sits directly under the controls (right below the AI
+              Profile selector) rather than pinned to the panel's bottom edge,
+              so it stays adjacent to the settings it acts on. */}
           <Button
             onClick={handlePrimary}
             disabled={isSubmitDisabled}
@@ -143,7 +144,7 @@ export default function GenerationPanel({ file, fullPath }: Props) {
               {submitting ? "Submitting…" : primaryLabel}
             </span>
           </Button>
-        </footer>
+        </div>
       </aside>
 
       <ConfirmDialog

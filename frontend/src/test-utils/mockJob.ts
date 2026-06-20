@@ -19,6 +19,10 @@ export function makeJob(overrides: Partial<Job> = {}): Job {
     updated_at: '2026-04-29T00:00:00Z',
     completed_at: null,
     jellyfin_refreshed_at: null,
+    verification_status: null,
+    verification_score: null,
+    verification_report: null,
+    verified_at: null,
     ...overrides,
   }
 }

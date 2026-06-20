@@ -2,8 +2,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { createMemoryRouter, RouterProvider } from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { ApiRequestError, getJob, getJobLog } from '@/lib/api'
+import { ApiRequestError, getJob, getJobLog, reverifyJob } from '@/lib/api'
 import { makeJob } from '@/test-utils/mockJob'
+import { useJobStore } from '@/store/jobStore'
 import JobDetailPage from './JobDetailPage'
 
 vi.mock('@/lib/api', async (orig) => {
@@ -12,6 +13,7 @@ vi.mock('@/lib/api', async (orig) => {
     ...actual,
     getJob: vi.fn(),
     getJobLog: vi.fn(),
+    reverifyJob: vi.fn(),
   }
 })
 
@@ -34,6 +36,8 @@ function renderJobDetail(jobId = 'abc-123') {
 beforeEach(() => {
   vi.mocked(getJob).mockReset()
   vi.mocked(getJobLog).mockReset()
+  vi.mocked(reverifyJob).mockReset()
+  useJobStore.setState({ jobs: [] })
 })
 
 describe('JobDetailPage', () => {
@@ -100,5 +104,51 @@ describe('JobDetailPage', () => {
     renderJobDetail()
     // Synthetic line still appears because rawLog is undefined
     expect(await screen.findByText(/Job received\. Initializing pipeline/)).toBeInTheDocument()
+  })
+
+  it('shows verification panel with check name and Re-verify button when verification_status is set', async () => {
+    vi.mocked(getJob).mockResolvedValue(
+      makeJob({
+        id: 'abc-123',
+        status: 'completed',
+        verification_status: 'warn',
+        verification_score: 60,
+        verification_report: {
+          summary: 'WARN — 0 fail, 1 warn',
+          checks: [{ layer: 'heuristic', name: 'repeat_loop', severity: 'warn', detail: 'longest run: 7' }],
+        },
+      }),
+    )
+    vi.mocked(getJobLog).mockResolvedValue('')
+    vi.mocked(reverifyJob).mockResolvedValue(undefined)
+    renderJobDetail('abc-123')
+
+    expect(await screen.findByText(/repeat_loop/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /re-verify/i })).toBeInTheDocument()
+  })
+
+  it('overlays a live verification verdict from the job store (post-Re-verify SSE)', async () => {
+    // react-query snapshot has NO verdict yet (job completed before verification)
+    vi.mocked(getJob).mockResolvedValue(
+      makeJob({ id: 'abc-123', status: 'completed', verification_status: null }),
+    )
+    vi.mocked(getJobLog).mockResolvedValue('')
+    // the live SSE job_update (partial) arrives in the store with a verdict
+    useJobStore.setState({
+      jobs: [{
+        id: 'abc-123',
+        verification_status: 'fail',
+        verification_score: 20,
+        verification_report: {
+          summary: 'FAIL — 1 fail',
+          checks: [{ layer: 'heuristic', name: 'repeat_loop', severity: 'fail', detail: 'longest run: 40' }],
+        },
+      } as never],
+    })
+    renderJobDetail('abc-123')
+
+    // the panel reflects the LIVE verdict, not the (null) query snapshot
+    expect(await screen.findByText(/repeat_loop/)).toBeInTheDocument()
+    expect(screen.getByText(/longest run: 40/)).toBeInTheDocument()
   })
 })

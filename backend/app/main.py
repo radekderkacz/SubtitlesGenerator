@@ -164,9 +164,29 @@ app.include_router(triggers.router, prefix=_API_V1_PREFIX)
 app.include_router(webhooks.router, prefix=_API_V1_PREFIX)
 
 _STATIC_DIR = Path("/app/static")
+
+
+def _spa_index_response() -> FileResponse:
+    """Serve the SPA entry point with revalidation forced.
+
+    ``index.html`` is the only unhashed file — it references the
+    content-hashed ``/assets/*`` bundles by name. Without an explicit
+    ``Cache-Control`` the browser may serve a stale ``index.html`` from cache
+    and keep pointing at an old bundle until a manual hard-refresh (this is
+    why the UI appeared to "lose" recent changes). ``no-cache`` makes the
+    browser revalidate on every load — cheap, since it's a 304 via the
+    existing etag when unchanged — so a new frontend build is picked up at
+    once.
+    """
+    return FileResponse(
+        str(_STATIC_DIR / "index.html"),
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
 if _STATIC_DIR.exists():
     app.mount("/assets", StaticFiles(directory=str(_STATIC_DIR / "assets")), name="assets")
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_spa(full_path: str) -> FileResponse:
-        return FileResponse(str(_STATIC_DIR / "index.html"))
+        return _spa_index_response()

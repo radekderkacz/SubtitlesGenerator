@@ -261,6 +261,11 @@ export async function testTranslationModel(
   )
 }
 
+/** POST /api/v1/jobs/:id/verify — re-run subtitle verification. */
+export async function reverifyJob(id: string): Promise<void> {
+  await apiFetch(`/api/v1/jobs/${encodeURIComponent(id)}/verify`, { method: 'POST' })
+}
+
 // ── Automations API ──────────────────────────────────────────────────────────
 
 export const listTriggers = (): Promise<Trigger[]> =>

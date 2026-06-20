@@ -1,6 +1,8 @@
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Response
+from redis.exceptions import RedisError
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,7 +19,7 @@ from app.models.schemas import (
 )
 from app.services import job_service
 from app.services.job_events import publish_job_update, publish_job_updates
-from app.worker.tasks import generate_subtitles
+from app.worker.tasks import generate_subtitles, verify_subtitles
 
 router = APIRouter()
 
@@ -25,6 +27,24 @@ DbSession = Annotated[AsyncSession, Depends(get_db)]
 
 _JOB_NOT_FOUND_DETAIL = "Job not found"
 _JOB_NOT_FOUND_CODE = "JOB_NOT_FOUND"
+
+logger = logging.getLogger(__name__)
+
+
+async def _announce_created(job) -> None:
+    """Publish a job_update for a freshly-created job — best-effort.
+
+    The row + Celery task are already committed by the time we get here, so a
+    transient Redis hiccup must never fail (or hang) the submission: it would
+    make the user think the submit failed and resubmit, creating a duplicate.
+    A missed publish only delays the live insert until the next page load
+    (which replays the full queue_state from the DB)."""
+    try:
+        await publish_job_update(job)
+    except (RedisError, OSError):
+        # A UI nicety that must never block a job already committed + dispatched
+        # (failing here would make the user think the submit failed → resubmit).
+        logger.warning("job %s created but live publish failed", job.id, exc_info=True)
 
 
 @router.post(
@@ -56,6 +76,11 @@ async def create_job(payload: JobCreate, session: DbSession):
                 "code": "PROFILE_NOT_FOUND",
             },
         )
+    # Announce the new queued job so an already-open Queue (the SSE stream is
+    # persistent at the app shell and isn't refetched on navigation) shows it
+    # immediately — otherwise a job submitted while the worker is busy stays
+    # invisible until the worker frees up and emits its first event.
+    await _announce_created(job)
     return job
 
 
@@ -131,7 +156,25 @@ async def retry_job(job_id: str, session: DbSession):
             content={"detail": str(e), "code": e.code},
         )
     generate_subtitles.delay(new_job.id)
+    await _announce_created(new_job)
     return new_job
+
+
+@router.post(
+    "/jobs/{job_id}/verify",
+    status_code=202,
+    response_model=JobResponse,
+    responses={404: {"description": "Job not found"}},
+)
+async def reverify_job(job_id: str, session: DbSession):
+    job = await job_service.get_job(session, job_id)
+    if job is None:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": _JOB_NOT_FOUND_DETAIL, "code": _JOB_NOT_FOUND_CODE},
+        )
+    verify_subtitles.delay(job_id)
+    return job
 
 
 @router.post(

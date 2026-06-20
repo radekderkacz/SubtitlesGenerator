@@ -88,6 +88,26 @@ class JobResponse(BaseModel):
     updated_at: datetime
     completed_at: Optional[datetime] = None
     jellyfin_refreshed_at: Optional[datetime] = None
+    verification_status: Optional[str] = None
+    verification_score: Optional[float] = None
+    verification_report: Optional[dict] = None
+    verified_at: Optional[datetime] = None
+
+
+class JobUpdatePayload(BaseModel):
+    """SSE ``job_update`` event payload shape (mirrors build_job_event_payload)."""
+
+    id: str
+    status: str
+    phase: Optional[str] = None
+    progress: int
+    updated_at: str  # ISO-8601 string as emitted by job_events
+    file_path: str
+    error_message: Optional[str] = None
+    verification_status: Optional[str] = None
+    verification_score: Optional[float] = None
+    verification_report: Optional[dict] = None
+    verified_at: Optional[str] = None  # ISO-8601 string or None
 
 
 class HistoryResponse(BaseModel):
@@ -107,6 +127,8 @@ class HistoryResponse(BaseModel):
     cost_usd: Optional[float] = None
     srt_path: Optional[str] = None
     error_message: Optional[str] = None
+    verification_status: Optional[str] = None
+    verification_score: Optional[float] = None
     created_at: datetime
     updated_at: datetime
     completed_at: Optional[datetime] = None

@@ -22,6 +22,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.media import is_video_file
 from app.models.orm import Settings, Trigger, TriggerEvent
 from app.models.schemas import JobCreate
+from redis.exceptions import RedisError
+
+from app.services.job_events import publish_job_update
 from app.services.job_service import enqueue_job
 
 logger = logging.getLogger(__name__)
@@ -144,6 +147,13 @@ async def dispatch_event(session: AsyncSession, evt: MatchEvent) -> str:
         source=f"trigger:{trig.id}",
     )
     job = await enqueue_job(session, payload)
+    # Surface the new queued job on the live Queue immediately (the SSE stream
+    # is persistent and isn't refetched on navigation). Best-effort: the row is
+    # already committed, so a Redis hiccup must not fail the dispatch.
+    try:
+        await publish_job_update(job)
+    except (RedisError, OSError):
+        logger.warning("trigger job %s created but live publish failed", job.id, exc_info=True)
     await _record_event(session, evt, matched_rule_index=None,
                         outcome="submitted", job_id=job.id, error=None)
     return "submitted"

@@ -149,6 +149,34 @@ async def test_post_jobs_creates_job_and_enqueues_task(client, make_settings_row
 
 
 @pytest.mark.asyncio
+async def test_post_jobs_publishes_creation_event_for_live_queue(client, make_settings_row):
+    """A newly-created job must publish a job_update so an already-open queue
+    (the SSE stream is persistent at the app-shell, never refetched on nav)
+    shows it immediately — even when the worker is busy with another job.
+
+    Regression: submitting a 2nd movie while the 1st was processing left the
+    2nd invisible until the 1st finished, because creation emitted no event."""
+    row = make_settings_row(
+        nas_mount_path="/mnt/nas",
+        transcription_backend="remote-api",
+        profiles=[_DEFAULT_PROFILE],
+    )
+    app.dependency_overrides[get_db] = _get_db_override(row, for_create=True)
+    with patch("app.worker.tasks.generate_subtitles") as mock_task, \
+         patch("app.api.jobs.publish_job_update", new_callable=AsyncMock) as mock_publish:
+        mock_task.delay.return_value = MagicMock()
+        response = await client.post(
+            "/api/v1/jobs",
+            json={"file_path": "/mnt/nas/movies/Film.mkv", "profile_name": "default", "translate": False},
+        )
+    assert response.status_code == 202
+    mock_publish.assert_awaited_once()
+    published = mock_publish.await_args.args[0]
+    assert published.id == response.json()["id"]
+    assert published.status == "queued"
+
+
+@pytest.mark.asyncio
 async def test_post_jobs_rejects_auto_target_with_translate_true(client, make_settings_row):
     """Defense-in-depth backend guard: even if a stale frontend bypasses
     the UI gate, the API rejects translate=true + target_language absent/auto
@@ -469,7 +497,8 @@ async def test_retry_job_happy_path(client):
     # Retry calls generate_subtitles.delay() directly via the api.jobs module
     # import (NOT via enqueue_job), so patch at the api.jobs symbol.
     with patch("app.api.jobs.job_service.retry_failed_job", new_callable=AsyncMock) as mock_retry, \
-         patch("app.api.jobs.generate_subtitles") as mock_celery:
+         patch("app.api.jobs.generate_subtitles") as mock_celery, \
+         patch("app.api.jobs.publish_job_update", new_callable=AsyncMock) as mock_publish:
         mock_retry.return_value = new_job
         # Body is ignored — retry always uses current Settings.
         response = await client.post("/api/v1/jobs/source-id/retry")
@@ -483,6 +512,9 @@ async def test_retry_job_happy_path(client):
     assert mock_retry.await_args.args[1] == "source-id"
     assert mock_retry.await_args.kwargs == {}
     mock_celery.delay.assert_called_once_with(new_job.id)
+    # the re-queued job must also be published so it shows up live (same gap)
+    mock_publish.assert_awaited_once()
+    assert mock_publish.await_args.args[0].id == new_job.id
 
 
 @pytest.mark.asyncio
@@ -594,3 +626,28 @@ async def test_jellyfin_refresh_happy_path(client, make_settings_row):
     body = response.json()
     assert body["jellyfin_refreshed_at"] is not None
     mock_publish.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/jobs/{id}/verify — Task 8
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_reverify_dispatches_task(client):
+    app.dependency_overrides[get_db] = _empty_db
+    job = _make_job(file_path="/mnt/nas/film.mkv", status="completed")
+    with patch("app.api.jobs.job_service.get_job", new_callable=AsyncMock) as mock_get, \
+         patch("app.api.jobs.verify_subtitles") as mock_task:
+        mock_get.return_value = job
+        response = await client.post(f"/api/v1/jobs/{job.id}/verify")
+    assert response.status_code == 202
+    mock_task.delay.assert_called_once_with(job.id)
+
+
+@pytest.mark.asyncio
+async def test_reverify_404_when_job_missing(client):
+    app.dependency_overrides[get_db] = _empty_db
+    with patch("app.api.jobs.job_service.get_job", new_callable=AsyncMock) as mock_get:
+        mock_get.return_value = None
+        response = await client.post("/api/v1/jobs/nope/verify")
+    assert response.status_code == 404

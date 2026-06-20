@@ -21,6 +21,14 @@ import pytest
 from app.services.trigger_executor import MatchEvent, dispatch_event
 
 
+@pytest.fixture(autouse=True)
+def _mock_publish():
+    """dispatch_event publishes a job_update on creation; these tests stub
+    enqueue_job with a minimal fake job, so stub the publish collaborator too."""
+    with patch("app.services.trigger_executor.publish_job_update", new=AsyncMock()):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------

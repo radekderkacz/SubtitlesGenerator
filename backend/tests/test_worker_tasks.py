@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.models.schemas import JobStatus, JobPhase
+from app.worker.cue_timing import format_cues_from_segments
 from app.worker.tasks import (
     _async_pipeline,
     _compress_audio_for_remote,
@@ -33,6 +34,19 @@ def _stub_jellyfin_refresh(request):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _stub_run_verification(request):
+    """Task 7 — post-completion verification is best-effort; stub it out in
+    pipeline tests that don't exercise verification directly so they don't
+    need to seed SRT files or a real DB session. Tests that exercise
+    run_verification directly opt out via `no_verification_stub`."""
+    if request.node.get_closest_marker("no_verification_stub") is not None:
+        yield
+        return
+    with patch("app.worker.tasks.run_verification", AsyncMock()):
+        yield
+
+
 def _make_job(**kwargs):
     job = MagicMock()
     job.id = "test-job-id"
@@ -47,6 +61,10 @@ def _make_job(**kwargs):
     job.model_size = None
     job.file_path = "/media/test.mkv"
     job.updated_at = datetime.now(timezone.utc)
+    job.verification_status = None
+    job.verification_score = None
+    job.verification_report = None
+    job.verified_at = None
     for k, v in kwargs.items():
         setattr(job, k, v)
     return job
@@ -490,7 +508,7 @@ async def test_pipeline_translation_provider_error_marks_job_failed(tmp_path):
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._update_job", mock_update), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
-         patch("app.worker.tasks._transcribe", AsyncMock(return_value=[{"text": "Bonjour"}])), \
+         patch("app.worker.tasks._transcribe", AsyncMock(return_value=[{"start": 0.0, "end": 1.0, "text": "Bonjour."}])), \
          patch("app.worker.tasks._write_srt_for", AsyncMock(return_value="/tmp/test.srt")), \
          patch("app.worker.tasks.aioredis.from_url", return_value=mock_redis), \
          patch("httpx.Client", return_value=mock_client):
@@ -926,14 +944,38 @@ def test_segments_to_srt():
     assert _segments_to_srt(segments) == expected
 
 
-def test_segments_to_srt_normalizes_multiline_text():
-    """Embedded newlines in text would break SRT cue boundaries — normalize to spaces."""
+def test_segments_to_srt_preserves_intentional_line_wrap():
+    """Cues are wrapped to <=2 lines by wrap_lines; SRT supports multi-line cues,
+    so the writer must keep those line breaks (flattening them would silently
+    discard the line-wrapping feature)."""
     segments = [
-        {"start": 0.0, "end": 1.0, "text": "Line one\nLine two\nLine three"},
+        {"start": 0.0, "end": 1.0, "text": "First line here\nSecond line here"},
     ]
     result = _segments_to_srt(segments)
-    assert "Line one Line two Line three" in result
-    assert "\nLine two" not in result
+    assert "First line here\nSecond line here" in result
+
+
+def test_segments_to_srt_strips_lines_and_drops_blank_lines():
+    """Each line is stripped and blank lines dropped so a stray double newline
+    can't break cue boundaries."""
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "  Line one  \n\n  Line two  "},
+    ]
+    result = _segments_to_srt(segments)
+    assert "Line one\nLine two" in result
+    assert "Line one\n\n" not in result
+
+
+def test_wrapped_cue_round_trips_through_srt_with_newline():
+    """End-to-end seam check: a >42-char cue produced by the heuristic must
+    still carry its wrap into the rendered SRT."""
+    cues = format_cues_from_segments([{
+        "start": 0.0, "end": 6.0,
+        "text": "This single sentence is definitely longer than forty-two characters here.",
+    }])
+    assert "\n" in cues[0]["text"]            # the cue is wrapped to two lines
+    out = _segments_to_srt(cues)
+    assert cues[0]["text"] in out             # and the wrap survives into the SRT
 
 
 def test_segments_to_srt_raises_on_missing_timestamps():
@@ -952,6 +994,64 @@ def test_output_srt_path():
     assert _output_srt_path("/media/movies/Oppenheimer.2023.mkv", "en") == "/media/movies/Oppenheimer.2023.en.srt"
     assert _output_srt_path("/media/movies/Film.mp4", "pl") == "/media/movies/Film.pl.srt"
     assert _output_srt_path("/nas/show/S01E02.avi", "es") == "/nas/show/S01E02.es.srt"
+
+
+# ---------------------------------------------------------------------------
+# Subtitle timing: the pipeline re-segments a multi-sentence transcription
+# segment into several speech-aligned cues (the reported all-at-once bug).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pipeline_resegments_multisentence_segment_into_cues(tmp_path):
+    """A single multi-sentence transcription segment must become several SRT
+    cues with distinct, non-overlapping windows — not one cue holding the whole
+    span (the bug this feature fixes)."""
+    nas = tmp_path
+    video = nas / "Film.mkv"
+    video.touch()
+
+    job = _make_job(file_path=str(video), source_language="en", target_language=None)
+    settings = MagicMock()
+    settings.nas_mount_path = str(nas)
+
+    async def mock_fetch(job_id):
+        return job
+
+    async def mock_fetch_settings():
+        return settings
+
+    async def mock_update(job_id, **fields):
+        for k, v in fields.items():
+            setattr(job, k, v)
+        return job
+
+    mock_redis = AsyncMock()
+    # One 9s segment, three sentences — the exact shape the live server returns.
+    transcription = {
+        "language": "en",
+        "segments": [{"start": 0.0, "end": 9.0,
+                      "text": "Look out! The bridge is closed. We have to turn back now."}],
+        "words": [],
+    }
+
+    with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
+         patch("app.worker.tasks._fetch_job", mock_fetch), \
+         patch("app.worker.tasks._fetch_settings", mock_fetch_settings), \
+         patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._extract_audio", AsyncMock()), \
+         patch("app.worker.tasks._transcribe", AsyncMock(return_value=transcription)), \
+         patch("app.worker.tasks.aioredis.from_url", return_value=mock_redis):
+        result = await _async_pipeline("test-job-id")
+
+    assert result["status"] == JobStatus.completed
+    srt = (nas / "Film.en.srt").read_text()
+    # three cue indices -> three sentences split out of the one segment
+    assert "1\n" in srt and "2\n" in srt and "3\n" in srt
+    assert "Look out!" in srt
+    assert "The bridge is closed." in srt
+    assert "We have to turn back now." in srt
+    # the last sentence must NOT start at 0 (the whole point of the fix)
+    assert "3\n00:00:00,000" not in srt
 
 
 # ---------------------------------------------------------------------------
@@ -1382,7 +1482,7 @@ def test_remote_blocking_compresses_and_uploads_mp3(monkeypatch, tmp_path):
 
     out = t._run_transcription_remote_blocking(str(tmp_path / "j.wav"),
               "https://api.groq.com/openai/v1", "whisper-large-v3-turbo", "gk")
-    assert out == {"language": "en", "segments": [{"start": 0.0, "end": 1.0, "text": "hi"}]}
+    assert out == {"language": "en", "segments": [{"start": 0.0, "end": 1.0, "text": "hi"}], "words": []}
     assert captured["fname"] == "j.remote.mp3"
     assert captured["mime"] == "audio/mpeg"
     assert not os.path.exists(mp3)  # temp mp3 cleaned up

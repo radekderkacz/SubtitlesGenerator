@@ -7,7 +7,6 @@ import {
   Sheet,
   SheetContent,
   SheetDescription,
-  SheetFooter,
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
@@ -119,34 +118,37 @@ export default function SubmitSheet({
               onChange={onChange}
               onProfileLinkClick={() => onOpenChange(false)}
             />
-          </div>
 
-          <SheetFooter className="border-t border-border p-4 flex-col gap-3">
-            <Button
-              onClick={handlePrimary}
-              disabled={isSubmitDisabled}
-              className="w-full gap-2 bg-[var(--action-accent)] hover:bg-[var(--action-accent)]/90 text-white font-semibold py-6 rounded-lg shadow-[0_0_15px_rgba(59,130,246,0.3)] text-sm uppercase tracking-wider"
-            >
-              {submitting ? (
-                <Loader2 className="h-5 w-5 animate-spin" aria-hidden="true" />
-              ) : (
-                <Sparkles className="h-5 w-5" aria-hidden="true" />
-              )}
-              <span>{submitting ? "Submitting…" : primaryLabel}</span>
-            </Button>
-            <div className="flex items-start gap-2 text-xs text-muted-foreground bg-secondary/40 border border-border rounded-md p-3">
-              <Info className="h-4 w-4 shrink-0 mt-0.5" aria-hidden="true" />
-              <span>Processing continues even if you close this tab.</span>
+            {/* Primary CTA sits directly under the controls (right below the AI
+                Profile selector), consistent with the desktop GenerationPanel,
+                rather than pinned in a bottom footer. */}
+            <div className="flex flex-col gap-3 pt-2">
+              <Button
+                onClick={handlePrimary}
+                disabled={isSubmitDisabled}
+                className="w-full gap-2 bg-[var(--action-accent)] hover:bg-[var(--action-accent)]/90 text-white font-semibold py-6 rounded-lg shadow-[0_0_15px_rgba(59,130,246,0.3)] text-sm uppercase tracking-wider"
+              >
+                {submitting ? (
+                  <Loader2 className="h-5 w-5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <Sparkles className="h-5 w-5" aria-hidden="true" />
+                )}
+                <span>{submitting ? "Submitting…" : primaryLabel}</span>
+              </Button>
+              <div className="flex items-start gap-2 text-xs text-muted-foreground bg-secondary/40 border border-border rounded-md p-3">
+                <Info className="h-4 w-4 shrink-0 mt-0.5" aria-hidden="true" />
+                <span>Processing continues even if you close this tab.</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => onOpenChange(false)}
+                disabled={submitting}
+                className="text-xs font-semibold uppercase tracking-widest text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
             </div>
-            <button
-              type="button"
-              onClick={() => onOpenChange(false)}
-              disabled={submitting}
-              className="text-xs font-semibold uppercase tracking-widest text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
-            >
-              Cancel
-            </button>
-          </SheetFooter>
+          </div>
         </SheetContent>
       </Sheet>
 

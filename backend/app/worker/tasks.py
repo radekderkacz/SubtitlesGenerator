@@ -13,9 +13,16 @@ from app.core.config import app_settings
 from app.models.orm import Job, Settings, _utcnow
 from app.models.schemas import JobStatus, JobPhase
 from app.worker.celery_app import celery_app
+from app.worker.cue_timing import (
+    extract_words,
+    format_cues,
+    format_cues_from_segments,
+    reflow_translated,
+)
 from app.worker.usage import UsageAccumulator, extract_usage
 
 from app.services.job_events import REDIS_CHANNEL as _REDIS_CHANNEL, build_job_event_payload
+from app.worker.subtitle_verify import verify as _verify_subtitles
 
 # Per-job logs live at the docker-compose mount point inside the worker
 # container (host: ./data/logs ↔ container: /app/logs). Previously this
@@ -241,7 +248,16 @@ def _run_transcription_remote_blocking(
         def _do_post() -> dict:
             with open(mp3_path, "rb") as f:
                 files = {"file": (os.path.basename(mp3_path), f, "audio/mpeg")}
-                data = {"model": model, "response_format": "verbose_json"}
+                # Request word-level timestamps. httpx encodes the dict-with-list
+                # value as repeated multipart fields; the list-of-tuples form
+                # breaks its multipart encoding. The live segment-only server
+                # ignores this field harmlessly — a word-capable backend honors
+                # it and extract_words(...) then activates the word path.
+                data = {
+                    "model": model,
+                    "response_format": "verbose_json",
+                    "timestamp_granularities[]": ["segment", "word"],
+                }
                 with httpx.Client(timeout=httpx.Timeout(3600.0, connect=30.0)) as client:
                     resp = client.post(endpoint, headers=headers, files=files, data=data)
                     try:
@@ -264,12 +280,12 @@ def _run_transcription_remote_blocking(
         for s in segments_raw
         if s.get("start") is not None and s.get("end") is not None
     ]
-    return {"language": language, "segments": segments}
+    return {"language": language, "segments": segments, "words": extract_words(body)}
 
 
 async def _transcribe(
     job: Job, job_id: str, audio_path: str, log_path: str, redis_client: aioredis.Redis
-) -> list:
+) -> dict:
     """Transcription via an OpenAI-compatible /v1/audio/transcriptions endpoint.
 
     Local WhisperX was removed in May 2026 — the app's role is to orchestrate
@@ -308,15 +324,17 @@ async def _transcribe(
         raise RuntimeError(
             f"Remote transcription returned unexpected shape: keys={list(result.keys())}"
         )
+    words = result.get("words") or []
     job = await _update_job(job_id, source_language=language, progress=60)
     _write_log(
         log_path, "INFO", job_id,
-        f"Transcription complete — language: {language}, segments: {len(segments)}",
+        f"Transcription complete — language: {language}, segments: {len(segments)}, "
+        f"words: {len(words)} ({'word-level' if words else 'segment-level heuristic'} timing)",
     )
     await _publish_event(redis_client, job)
-    # No alignment step — remote endpoint returns segment-level timestamps
-    # which is what the SRT writer downstream consumes.
-    return segments
+    # Return the full result so the pipeline can re-segment into speech-aligned
+    # cues via build_source_cues (word path when words exist, else heuristic).
+    return result
 
 
 
@@ -764,6 +782,25 @@ def _format_srt_timestamp(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def build_source_cues(transcription) -> list[dict]:
+    """Re-segment a transcription into speech-aligned, reading-speed-bounded cues.
+
+    Word path: when the backend returns word-level timestamps, regroup words
+    into sentence cues. Heuristic path (the live segment-only server): split
+    each segment's text into sentences and distribute its time span across them.
+    Both apply the same timing + line-wrapping rules. Accepts a bare segment
+    list as a no-words transcription for defensive/legacy callers.
+    """
+    if isinstance(transcription, dict):
+        words = transcription.get("words") or []
+        segments = transcription.get("segments") or []
+    else:
+        words, segments = [], (transcription or [])
+    if words:
+        return format_cues(words)
+    return format_cues_from_segments(segments)
+
+
 def _segments_to_srt(segments: list) -> str:
     parts: list[str] = []
     for i, segment in enumerate(segments, start=1):
@@ -773,7 +810,11 @@ def _segments_to_srt(segments: list) -> str:
             raise RuntimeError(f"Segment {i} missing required start/end timestamps")
         start = _format_srt_timestamp(float(start_val))
         end = _format_srt_timestamp(float(end_val))
-        text = " ".join((segment.get("text") or "").splitlines()).strip()
+        # Preserve intentional line wrapping (cues are wrapped to <=2 lines by
+        # wrap_lines — a valid multi-line SRT cue). Strip each line and drop
+        # blank lines so a stray double newline can't break cue boundaries.
+        lines = [ln.strip() for ln in (segment.get("text") or "").splitlines() if ln.strip()]
+        text = "\n".join(lines)
         parts.append(f"{i}\n{start} --> {end}\n{text}\n")
     return "\n".join(parts)
 
@@ -942,7 +983,7 @@ async def _async_pipeline(job_id: str) -> dict:
             await _extract_audio(job, job_id, audio_path, log_path, redis_client)
             if (result := await _check_cancel_after(job_id, log_path, "extract")):
                 return result
-            src_segments = await _transcribe(job, job_id, audio_path, log_path, redis_client)
+            transcription = await _transcribe(job, job_id, audio_path, log_path, redis_client)
             if (result := await _check_cancel_after(job_id, log_path, "transcribe")):
                 return result
 
@@ -950,13 +991,25 @@ async def _async_pipeline(job_id: str) -> dict:
             job = await _fetch_job(job_id)
             src_lang = job.source_language
 
-            source_srt = await _write_srt_for(job, job_id, src_segments, src_lang, log_path, redis_client)
+            # Re-segment into speech-aligned, reading-speed-bounded cues (word
+            # path when the backend gives word timestamps, else the segment-only
+            # sentence heuristic). These wrapped cues are the source SRT.
+            src_cues = build_source_cues(transcription)
+            source_srt = await _write_srt_for(job, job_id, src_cues, src_lang, log_path, redis_client)
 
             if job.target_language:
-                translated_segments = await _translate(job, job_id, src_segments, log_path, redis_client)
+                # Translate per cue on unwrapped copies (1:1, source-derived
+                # timing preserved) so no source line breaks reach the model;
+                # reflow_translated re-times + re-wraps the translated text.
+                translate_cues = [
+                    {"start": c["start"], "end": c["end"], "text": " ".join(c["text"].splitlines())}
+                    for c in src_cues
+                ]
+                translated_cues = await _translate(job, job_id, translate_cues, log_path, redis_client)
                 if (result := await _check_cancel_after(job_id, log_path, "translate")):
                     return result
-                target_srt = await _write_srt_for(job, job_id, translated_segments, job.target_language, log_path, redis_client)
+                translated_cues = reflow_translated(translated_cues)
+                target_srt = await _write_srt_for(job, job_id, translated_cues, job.target_language, log_path, redis_client)
                 srt_path = target_srt
             else:
                 srt_path = source_srt
@@ -971,6 +1024,14 @@ async def _async_pipeline(job_id: str) -> dict:
             # fire-and-forget Jellyfin library refresh. Never
             # raises; failures stay out of the worker's success path.
             await _trigger_jellyfin_refresh(job_id, log_path, redis_client)
+
+            # Post-completion verification — best-effort, never re-raises.
+            try:
+                await run_verification(job_id)
+            except Exception:  # noqa: BLE001
+                _write_log(log_path, "WARNING", job_id,
+                           "post-completion verification failed (non-fatal)")
+
             return {"status": JobStatus.completed, "srt_path": srt_path}
 
         except Exception as exc:
@@ -1010,3 +1071,102 @@ def generate_subtitles(self, job_id: str) -> dict:
     return _run_generate(self, job_id)
 
 
+# ---------------------------------------------------------------------------
+# Post-completion subtitle verification
+# ---------------------------------------------------------------------------
+
+async def _publish_job_update_safe(job: Job) -> None:
+    """Best-effort publish using its own Redis connection. Never raises."""
+    from app.services.job_events import publish_job_update
+    from redis.exceptions import RedisError
+    try:
+        await publish_job_update(job)
+    except (RedisError, OSError):
+        pass
+
+
+def _verification_srt_paths(job: Job) -> tuple[list[str], str | None]:
+    """Return ([primary SRT to verify], source SRT path for faithfulness | None).
+
+    Primary = target SRT when translated, else source SRT."""
+    src = _output_srt_path(job.file_path, job.source_language) if job.source_language else None
+    if job.target_language:
+        return [_output_srt_path(job.file_path, job.target_language)], src
+    return ([src] if src else []), None
+
+
+def _verification_model_cfg(job: Job) -> dict | None:
+    """Build LLM model_cfg from the job's backend profile, or None if unconfigured."""
+    try:
+        b = _job_backend(job)
+    except RuntimeError:
+        return None
+    model = b.get("translation_model")
+    if not model:
+        return None
+    base_url, api_key, mapped = _resolve_litellm_target(
+        b.get("translation_provider"), model,
+        b.get("translation_api_url"), b.get("translation_api_key"),
+    )
+    return {"mapped_model": mapped, "base_url": base_url, "api_key": api_key}
+
+
+def _probe_duration(media_path: str) -> float | None:
+    """Best-effort media duration (seconds) via ffprobe, for the coverage check.
+    Returns None on any failure — coverage is then skipped, not failed."""
+    try:
+        import ffmpeg
+        dur = ffmpeg.probe(media_path).get("format", {}).get("duration")
+        return float(dur) if dur is not None else None
+    except Exception:
+        return None
+
+
+def _run_verification_verdict(job: Job) -> dict:
+    """Read the SRT(s) and run _verify_subtitles(). Best-effort by contract: ANY
+    failure (missing file, bad profile config raising RuntimeError, LLM/parse
+    error) becomes an 'error' verdict rather than raising — so a job never gets
+    stranded in verification_status='running'."""
+    try:
+        primary, source_path = _verification_srt_paths(job)
+        if not primary or not os.path.exists(primary[0]):
+            return {"status": "error", "score": 0.0,
+                    "report": {"summary": "no SRT found on disk", "checks": []}}
+        with open(primary[0], encoding="utf-8", errors="replace") as f:
+            srt_text = f.read()
+        source_text = None
+        if job.target_language and source_path and os.path.exists(source_path):
+            with open(source_path, encoding="utf-8", errors="replace") as f:
+                source_text = f.read()
+        model_cfg = _verification_model_cfg(job)
+        return _verify_subtitles(srt_text, source_srt_text=source_text,
+                                 video_duration=_probe_duration(job.file_path),
+                                 model_cfg=model_cfg)
+    except Exception as e:  # best-effort: never strand the job in 'running'
+        return {"status": "error", "score": 0.0,
+                "report": {"summary": f"verification error: {type(e).__name__}", "checks": []}}
+
+
+async def run_verification(job_id: str) -> None:
+    """Async orchestration: fetch job → set running → verify → persist → publish."""
+    job = await _fetch_job(job_id)
+    if job is None:
+        return
+    job = await _update_job(job_id, verification_status="running")
+    await _publish_job_update_safe(job)
+    # The verdict does blocking I/O (file reads) + a synchronous LLM call; run it
+    # off the event loop so it doesn't stall SSE/other coroutines on the worker.
+    verdict = await asyncio.to_thread(_run_verification_verdict, job)
+    job = await _update_job(
+        job_id,
+        verification_status=verdict["status"],
+        verification_score=verdict["score"],
+        verification_report=verdict["report"],
+        verified_at=_utcnow(),
+    )
+    await _publish_job_update_safe(job)
+
+
+@celery_app.task(name="verify_subtitles")
+def verify_subtitles(job_id: str) -> None:
+    asyncio.run(run_verification(job_id))

@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends
@@ -22,7 +23,7 @@ DbSession = Annotated[AsyncSession, Depends(get_db)]
     responses={
         400: {"description": "Path is outside the configured NAS mount root"},
         404: {"description": "Directory not found"},
-        422: {"description": "NAS mount path is not configured"},
+        422: {"description": "NAS mount path is not configured or missing in the container"},
     },
 )
 async def browse(session: DbSession, path: Optional[str] = None):
@@ -32,6 +33,24 @@ async def browse(session: DbSession, path: Optional[str] = None):
         return JSONResponse(
             status_code=422,
             content={"detail": "NAS mount path is not configured", "code": "NAS_NOT_CONFIGURED"},
+        )
+
+    # Distinguish "the configured NAS root itself is missing in the container"
+    # (a misconfiguration — e.g. a stale /shared after the mount moved to /media)
+    # from "a requested subdirectory doesn't exist" (a plain 404 below). The
+    # former is unfixable by browsing, so give an actionable message instead of
+    # a generic "Directory not found".
+    if not Path(settings_row.nas_mount_path).is_dir():
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": (
+                    f"Configured media path '{settings_row.nas_mount_path}' isn't available "
+                    "inside the app container. The library is mounted at /media — set "
+                    "Settings → Media Library to /media."
+                ),
+                "code": "NAS_ROOT_MISSING",
+            },
         )
 
     try:

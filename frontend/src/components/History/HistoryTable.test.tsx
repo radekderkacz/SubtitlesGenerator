@@ -25,6 +25,8 @@ function makeEntry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
     updated_at: '2026-04-24T09:36:00Z',
     completed_at: '2026-04-24T09:36:00Z',
     jellyfin_refreshed_at: null,
+    verification_status: null,
+    verification_score: null,
     ...overrides,
   }
 }
@@ -83,6 +85,12 @@ describe('HistoryTable', () => {
     expect(screen.getByText('Foo.en.srt')).toBeInTheDocument()
   })
 
+  it('renders the verification badge when the entry has a verdict', () => {
+    renderWithRouter([makeEntry({ verification_status: 'pass', verification_score: 95 })])
+    // badge shows "Verified 95" (distinct from the plain "Verified" column header)
+    expect(screen.getByText(/verified 95/i)).toBeInTheDocument()
+  })
+
   it('shows — for SRT path when the entry has none', () => {
     const failedEarly = makeEntry({ status: 'failed', srt_path: null, error_message: 'CUDA OOM' })
     renderWithRouter([failedEarly])
@@ -132,6 +140,8 @@ describe('HistoryTable', () => {
       updated_at: '2026-05-17T00:10:00Z',
       completed_at: '2026-05-17T00:10:00Z',
       jellyfin_refreshed_at: null,
+      verification_status: null,
+      verification_score: null,
     }
     const rows: HistoryEntry[] = [
       { ...base, id: 'a', translation_provider: 'openrouter', translation_model: 'google/gemini-2.0-flash-001', prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500, cost_usd: 0.0123 },

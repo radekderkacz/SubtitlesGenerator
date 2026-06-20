@@ -4,6 +4,8 @@ A self-hosted subtitle pipeline for your media library. Drop a movie in a folder
 
 - **Transcription** is delegated to any OpenAI-compatible `/v1/audio/transcriptions` endpoint — self-host [faster-whisper-server](https://github.com/fedirz/faster-whisper-server) or [speaches](https://github.com/speaches-ai/speaches), or use a hosted provider (Groq, OpenAI).
 - **Translation** is delegated to your choice of provider — Ollama (self-hosted), OpenAI, OpenRouter, Anthropic, or Google Translate.
+- **Speech-aligned timing** — output is re-segmented into sentence-level, reading-speed-bounded, line-wrapped cues (not a raw one-cue-per-segment dump), so subtitles appear when they're spoken.
+- **Quality verification** — every completed job is automatically checked: structural validity (timing, coverage), hallucination heuristics (repeat loops, artifacts), and an optional LLM coherence/faithfulness judge. You get a pass / warn / fail verdict per job, with a report and a one-click re-verify. It never blocks output — it's a signal.
 - **Jellyfin** integration is optional — if configured, a library refresh is triggered after every completed job so the new subtitle track appears immediately.
 
 The app itself is the orchestrator: a FastAPI backend, a React UI, a Celery worker, and Postgres + Redis. No GPU required on the docker host (your Whisper server does the heavy lifting wherever it lives).

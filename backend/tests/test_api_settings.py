@@ -84,6 +84,9 @@ async def test_put_settings_invalid_nas_path(client):
     assert response.status_code == 422
     data = response.json()
     assert data["code"] == "INVALID_NAS_PATH"
+    # actionable: name the offending path and point at the /media default
+    assert "/mnt/nonexistent/path/that/does/not/exist" in data["detail"]
+    assert "/media" in data["detail"]
 
 
 @pytest.mark.asyncio

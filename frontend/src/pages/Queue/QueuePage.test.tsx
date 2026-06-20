@@ -7,6 +7,7 @@ import { baseMockSettings } from '@/test-utils/mockSettings'
 import { useJobStore } from '@/store/jobStore'
 import { Toaster } from '@/components/ui/sonner'
 import { makeJob } from '@/test-utils/mockJob'
+import type { JobUpdatePayload } from '@/types/api'
 import QueuePage from './QueuePage'
 
 vi.mock('@/lib/api', () => ({
@@ -122,6 +123,29 @@ describe('QueuePage', () => {
     vi.mocked(apiFetch).mockReturnValue(new Promise(() => {}))
     renderQueuePage()
     expect(screen.queryByText(/Setup required/)).not.toBeInTheDocument()
+  })
+
+  it('shows a job created while another is processing (partial SSE creation event) in Up Next', async () => {
+    // Regression: a 2nd movie submitted while the 1st was processing stayed
+    // invisible. The backend now publishes a job_update on creation, which
+    // arrives as a PARTIAL job (only SSE payload fields — no created_at /
+    // source_language). It must still render in Up Next.
+    vi.mocked(apiFetch).mockResolvedValue({ ...baseMockSettings, nas_mount_path: '/mnt/nas' })
+    useJobStore.setState({
+      jobs: [makeJob({ id: 'j1', status: 'processing', file_path: '/media/Movie/First.Movie.mkv' })],
+      isConnected: true,
+    })
+    useJobStore.getState().applyJobUpdate({
+      id: 'j2',
+      status: 'queued',
+      phase: null,
+      progress: 0,
+      updated_at: '2026-06-19T00:00:00Z',
+      file_path: '/media/Movie/Second.Movie.mkv',
+      error_message: null,
+    } as JobUpdatePayload)
+    renderQueuePage()
+    expect(await screen.findByText('Second.Movie.mkv')).toBeInTheDocument()
   })
 
   // useJobStream moved to Layout (app-shell) so SSE survives navigation.

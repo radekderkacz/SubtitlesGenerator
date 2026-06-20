@@ -1,12 +1,15 @@
 import { Link, useParams } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowLeft, FileQuestion } from 'lucide-react'
+import { ArrowLeft, FileQuestion, RefreshCw } from 'lucide-react'
 import PhaseBadge from '@/components/Queue/PhaseBadge'
 import PhaseTimeline from '@/components/Queue/PhaseTimeline'
 import CompletionCard from '@/components/Queue/CompletionCard'
 import ErrorCard from '@/components/Queue/ErrorCard'
 import LiveLogPane from '@/components/Queue/LiveLogPane'
-import { ApiRequestError, getJob, getJobLog } from '@/lib/api'
+import VerificationBadge from '@/components/Queue/VerificationBadge'
+import { ApiRequestError, getJob, getJobLog, reverifyJob } from '@/lib/api'
+import { useJobStore } from '@/store/jobStore'
+import { withApiToast } from '@/lib/apiToast'
 import { basename, formatDuration } from '@/lib/utils'
 import type { Job } from '@/types/api'
 
@@ -33,6 +36,93 @@ function formatSubmittedAt(iso: string): string {
   })
 }
 
+type CheckRowProps = Readonly<{
+  layer: string
+  name: string
+  severity: string
+  detail: string
+}>
+
+function severityClass(severity: string): string {
+  if (severity === 'fail') return 'text-destructive'
+  if (severity === 'warn') return 'text-amber-500'
+  return 'text-muted-foreground'
+}
+
+function CheckRow({ name, severity, detail }: CheckRowProps) {
+  return (
+    <li className={`flex items-start gap-2 text-xs ${severityClass(severity)}`}>
+      <span className="font-mono font-semibold shrink-0">{name}</span>
+      <span className="text-muted-foreground">{detail}</span>
+    </li>
+  )
+}
+
+type VerificationPanelProps = Readonly<{ job: Job }>
+
+function VerificationPanel({ job }: VerificationPanelProps) {
+  if (!job.verification_status) return null
+
+  const report = job.verification_report
+  const checks = report?.checks ?? []
+
+  const layers = ['structural', 'heuristic', 'semantic'] as const
+  const grouped = layers.map((layer) => ({
+    layer,
+    items: checks.filter((c) => c.layer === layer),
+  })).filter((g) => g.items.length > 0)
+
+  const handleReverify = () => {
+    void withApiToast(() => reverifyJob(job.id), { successMessage: 'Re-verification started' })
+  }
+
+  return (
+    <section
+      aria-labelledby="verification-heading"
+      className="bg-card border border-border rounded-lg p-6"
+    >
+      <div className="flex items-center justify-between mb-4">
+        <h2
+          id="verification-heading"
+          className="text-sm font-semibold text-muted-foreground uppercase tracking-wider"
+        >
+          Verification
+        </h2>
+        <VerificationBadge status={job.verification_status} score={job.verification_score} />
+      </div>
+      {report?.summary && (
+        <p className="text-xs text-muted-foreground mb-4">{report.summary}</p>
+      )}
+      {grouped.length > 0 && (
+        <div className="space-y-3">
+          {grouped.map(({ layer, items }) => (
+            <div key={layer}>
+              <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground mb-1">
+                {layer}
+              </p>
+              <ul className="space-y-1">
+                {items.map((c, i) => (
+                  <CheckRow key={`${c.name}-${i}`} layer={c.layer} name={c.name} severity={c.severity} detail={c.detail} />
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="mt-4">
+        <button
+          type="button"
+          onClick={handleReverify}
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-secondary text-secondary-foreground text-xs font-medium hover:opacity-90 transition-opacity"
+        >
+          <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+          Re-verify
+        </button>
+      </div>
+    </section>
+  )
+}
+
 export default function JobDetailPage(_props: Props) {
   const { id } = useParams<{ id: string }>()
   const safeId = id ?? ''
@@ -57,6 +147,13 @@ export default function JobDetailPage(_props: Props) {
     retry: false,
   })
 
+  // The verification verdict lands AFTER this page's react-query snapshot (it's
+  // post-completion / triggered by Re-verify), arriving over SSE into the job
+  // store. Overlay the live verification fields so the panel updates without a
+  // manual reload. (The store entry may be a partial — only verification fields
+  // are overlaid; the rest of the job comes from the query.)
+  const liveJob = useJobStore((s) => s.jobs.find((j) => j.id === safeId))
+
   if (jobQuery.isError && jobQuery.error instanceof ApiRequestError && jobQuery.error.status === 404) {
     return <NotFoundState />
   }
@@ -69,7 +166,14 @@ export default function JobDetailPage(_props: Props) {
     )
   }
 
-  const job = jobQuery.data
+  const job = liveJob
+    ? {
+        ...jobQuery.data,
+        verification_status: liveJob.verification_status ?? jobQuery.data.verification_status,
+        verification_score: liveJob.verification_score ?? jobQuery.data.verification_score,
+        verification_report: liveJob.verification_report ?? jobQuery.data.verification_report,
+      }
+    : jobQuery.data
   const filename = basename(job.file_path)
   const showCompletion = job.status === 'completed'
   const showError = job.status === 'failed'
@@ -129,6 +233,7 @@ export default function JobDetailPage(_props: Props) {
           </section>
           {showCompletion && <CompletionCard job={job} />}
           {showError && <ErrorCard job={job} />}
+          <VerificationPanel job={job} />
         </div>
         <div className="flex-1 min-w-0">
           <LiveLogPane job={job} rawLog={logQuery.data} />

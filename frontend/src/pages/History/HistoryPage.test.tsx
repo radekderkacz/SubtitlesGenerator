@@ -44,6 +44,8 @@ function makeEntry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
     updated_at: '2026-04-24T09:36:00Z',
     completed_at: '2026-04-24T09:36:00Z',
     jellyfin_refreshed_at: null,
+    verification_status: null,
+    verification_score: null,
     ...overrides,
   }
 }

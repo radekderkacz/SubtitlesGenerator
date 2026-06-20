@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Check, Copy } from 'lucide-react'
 import { useNavigate } from 'react-router'
 import ColorPillBadge from '@/components/Queue/ColorPillBadge'
+import VerificationBadge from '@/components/Queue/VerificationBadge'
 import RowActionsMenu from './RowActionsMenu'
 import { basename, formatDuration } from '@/lib/utils'
 import type { HistoryEntry, TerminalStatus } from '@/types/api'
@@ -86,6 +87,9 @@ export default function HistoryTable({ entries, onDelete }: Props) {
             <th className="px-4 py-3 text-[11px] font-medium text-muted-foreground uppercase tracking-wider">
               Completed
             </th>
+            <th className="px-4 py-3 text-[11px] font-medium text-muted-foreground uppercase tracking-wider">
+              Verified
+            </th>
             <th className="px-4 py-3 text-[11px] font-medium text-muted-foreground uppercase tracking-wider text-right">
               Actions
             </th>
@@ -163,6 +167,9 @@ function HistoryRow({ entry, onDelete }: RowProps) {
       <td className="px-4 py-2 text-xs text-muted-foreground">{durationLabel(entry)}</td>
       <td className="px-4 py-2 text-xs text-muted-foreground">
         {formatCompletedAt(entry.completed_at ?? entry.updated_at)}
+      </td>
+      <td className="px-4 py-2">
+        <VerificationBadge status={entry.verification_status} score={entry.verification_score} />
       </td>
       <td className="px-4 py-2 text-right">
         <RowActionsMenu jobId={entry.id} onDelete={onDelete} />

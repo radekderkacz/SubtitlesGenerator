@@ -31,6 +31,8 @@ export function makeHistoryEntry(
     updated_at: '2026-04-29T00:00:00Z',
     completed_at: '2026-04-29T00:00:00Z',
     jellyfin_refreshed_at: null,
+    verification_status: null,
+    verification_score: null,
     ...overrides,
   }
 }

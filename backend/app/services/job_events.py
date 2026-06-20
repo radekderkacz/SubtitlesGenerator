@@ -34,6 +34,10 @@ def build_job_event_payload(job: Job) -> dict[str, Any]:
         # frontend has a stable shape; the cost is ~100 bytes per message.
         "file_path": job.file_path,
         "error_message": job.error_message,
+        "verification_status": job.verification_status,
+        "verification_score": job.verification_score,
+        "verification_report": job.verification_report,
+        "verified_at": job.verified_at.isoformat() if job.verified_at else None,
     }
 
 

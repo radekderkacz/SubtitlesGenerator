@@ -4,6 +4,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from app.services.trigger_executor import MatchEvent, dispatch_event
 
 
+@pytest.fixture(autouse=True)
+def _mock_publish():
+    """dispatch_event now publishes a job_update on creation (so the live Queue
+    shows trigger-created jobs immediately). These tests stub enqueue_job with a
+    minimal fake job, so stub the publish collaborator too."""
+    with patch("app.services.trigger_executor.publish_job_update", new=AsyncMock()):
+        yield
+
+
 def _trig(action=None, file_filter=None, type_="watch", config=None):
     return type(
         "T",

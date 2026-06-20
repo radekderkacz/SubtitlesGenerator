@@ -171,7 +171,10 @@ def _validate_path_fields(update_dict: dict) -> JSONResponse | None:
             return JSONResponse(
                 status_code=422,
                 content={
-                    "detail": "NAS mount path does not exist or is not a directory",
+                    "detail": (
+                        f"NAS mount path '{nas_path}' does not exist inside the app container. "
+                        "The library is mounted at /media — set this to /media."
+                    ),
                     "code": "INVALID_NAS_PATH",
                 },
             )

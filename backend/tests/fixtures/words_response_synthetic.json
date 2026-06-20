@@ -1,0 +1,22 @@
+{
+    "_comment": "SYNTHETIC fixture. Some transcription backends (e.g. a minimal custom server) return segment-level timestamps only and silently ignore timestamp_granularities[] (see fws_segment_response.json for a real segment-only capture). This file models the standard OpenAI / faster-whisper-server verbose_json word shape (words nested under each segment, tokens carry a leading space and punctuation) so the word-level path stays tested until a word-capable server is configured.",
+    "task": "transcribe",
+    "language": "en",
+    "duration": 2.0,
+    "text": " Hello there. How are you?",
+    "segments": [
+        {
+            "id": 0,
+            "start": 0.0,
+            "end": 2.0,
+            "text": " Hello there. How are you?",
+            "words": [
+                {"word": " Hello", "start": 0.0, "end": 0.4, "probability": 0.99},
+                {"word": " there.", "start": 0.4, "end": 0.9, "probability": 0.98},
+                {"word": " How", "start": 1.0, "end": 1.3, "probability": 0.97},
+                {"word": " are", "start": 1.3, "end": 1.5, "probability": 0.99},
+                {"word": " you?", "start": 1.5, "end": 2.0, "probability": 0.96}
+            ]
+        }
+    ]
+}

@@ -107,6 +107,18 @@ describe('SubmitSheet', () => {
     expect(screen.getByRole('button', { name: 'Generate Subtitles' })).toBeInTheDocument()
   })
 
+  it('places the Generate button under the controls, not in the bottom footer', () => {
+    renderSheet({ file: mkFile({ has_srt: false }) })
+    const button = screen.getByRole('button', { name: 'Generate Subtitles' })
+    // Consistent with GenerationPanel: inline beneath the controls, NOT pinned
+    // in the SheetFooter at the bottom of the drawer.
+    expect(button.closest('[data-slot="sheet-footer"]')).toBeNull()
+    // It must share the scrollable content container with the AI Profile control.
+    const scroll = screen.getByText('AI Profile').closest('.overflow-y-auto')
+    expect(scroll).not.toBeNull()
+    expect(scroll?.contains(button)).toBe(true)
+  })
+
   it('shows "Regenerate" CTA when has_srt=true', () => {
     renderSheet({ file: mkFile({ has_srt: true }) })
     expect(screen.getByRole('button', { name: 'Regenerate' })).toBeInTheDocument()
