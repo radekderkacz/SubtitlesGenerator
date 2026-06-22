@@ -1,5 +1,5 @@
 # Stage 1: build the React frontend
-FROM node:22-alpine AS frontend-builder
+FROM node:26-alpine AS frontend-builder
 WORKDIR /frontend
 COPY frontend/package*.json ./
 RUN npm ci
@@ -10,7 +10,7 @@ ARG APP_BUILD_SHA=""
 RUN APP_BUILD_SHA="$APP_BUILD_SHA" npm run build
 
 # Stage 2: Python app
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # OCI metadata — GHCR auto-links the package to this repo via the source label
 LABEL org.opencontainers.image.source="https://github.com/radekderkacz/SubtitlesGenerator" \
