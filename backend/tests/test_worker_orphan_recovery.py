@@ -122,4 +122,6 @@ async def test_recover_orphans_dispatch_happens_after_commit():
 def test_orphan_age_threshold_is_30s():
     """Pin the policy threshold so a future refactor that loosens it makes
     a deliberate, reviewable change rather than a silent one."""
-    assert orphan_recovery.ORPHAN_AGE_SECONDS == 30
+    # WS9: raised above the 60s in-task heartbeat so a live-but-silent job
+    # (long transcription POST) can never be swept and double-run.
+    assert orphan_recovery.ORPHAN_AGE_SECONDS >= 120

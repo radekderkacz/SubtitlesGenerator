@@ -87,7 +87,7 @@ export default function GenerationPanel({ file, fullPath }: Props) {
     return (
       <aside
         aria-label="Generation Settings"
-        className="w-[380px] shrink-0 border-l border-border bg-popover hidden xl:flex flex-col"
+        className="w-[380px] shrink-0 border-l border-border bg-popover hidden xl:flex flex-col min-h-0 overflow-hidden"
       >
         <header className="p-6 border-b border-border">
           <h2 className="text-base font-semibold text-foreground">
@@ -105,7 +105,7 @@ export default function GenerationPanel({ file, fullPath }: Props) {
     <>
       <aside
         aria-label={`Generation Settings: ${filename}`}
-        className="w-[380px] shrink-0 border-l border-border bg-popover hidden xl:flex flex-col shadow-[-10px_0_30px_rgba(0,0,0,0.2)]"
+        className="w-[380px] shrink-0 border-l border-border bg-popover hidden xl:flex flex-col shadow-[-10px_0_30px_rgba(0,0,0,0.2)] min-h-0 overflow-hidden"
       >
         <header className="p-6 border-b border-border">
           <h2 className="text-base font-semibold text-foreground">

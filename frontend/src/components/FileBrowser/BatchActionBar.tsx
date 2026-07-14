@@ -5,11 +5,10 @@ import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import GenerationControls, {
   controlsBlockedReason,
-  buildJobPayload,
   useGenerationControlsState,
 } from "@/components/SubmitSheet/GenerationControls";
-import { apiFetch, submitJob } from "@/lib/api";
-import { withApiToast } from "@/lib/apiToast";
+import { apiFetch } from "@/lib/api";
+import { submitBatch } from "./batchSubmit";
 import type { Settings, FileBrowseEntry } from "@/types/api";
 
 type Props = Readonly<{
@@ -55,38 +54,20 @@ export default function BatchActionBar({
   const handleSubmit = async () => {
     if (blockedReason !== null || eligiblePaths.length === 0) return;
     setIsSubmitting(true);
-    let succeeded = 0;
-    let failed = 0;
-    for (const fullPath of eligiblePaths) {
-      // Pass no successMessage so withApiToast stays silent on success — we
-      // emit a single summary toast at the end. Per-file errors still surface.
-      const ok = await withApiToast(() =>
-        submitJob(buildJobPayload(fullPath, values)),
-      );
-      if (ok) succeeded += 1;
-      else failed += 1;
-    }
+    const n = await submitBatch(eligiblePaths, values);
     setIsSubmitting(false);
-    if (succeeded > 0 || failed === 0) {
-      const tail = failed > 0 ? ` (${failed} failed)` : "";
-      // Final summary toast — withApiToast was silent on success above.
-      // Deferred import: keeps sonner out of this component's module graph
-      // until the rare batch-summary path actually runs.
-      const { toast } = await import("sonner");
-      toast(`Queued ${succeeded} job${succeeded === 1 ? "" : "s"}${tail}`);
-    }
     onCleared();
     // Mirror the single-file SubmitSheet flow: jump the user to the Active
     // Queue so they immediately see the work they just queued (and the
     // per-row cancel X on each row). Only on a real success — leaving the
     // user on Library is the right behaviour when nothing was queued.
-    if (succeeded > 0) navigate("/");
+    if (n > 0) navigate("/");
   };
 
   return (
     <section
       aria-label="Batch submission"
-      className="fixed bottom-0 right-0 left-64 z-30 bg-card border-t border-border shadow-[0_-10px_30px_rgba(0,0,0,0.3)] px-6 py-4"
+      className="fixed bottom-0 right-0 left-64 z-30 bg-card border-t border-border shadow-[0_-10px_30px_rgba(0,0,0,0.3)] px-6 py-4 xl:hidden"
     >
       <div className="max-w-[1280px] mx-auto flex flex-wrap items-start gap-6">
         <div className="flex-1 min-w-[260px] space-y-3">

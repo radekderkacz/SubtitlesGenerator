@@ -43,7 +43,8 @@ def retry_call(fn, *, step: str, backoffs: list[float]):
     while True:
         try:
             return fn()
-        except Exception as exc:  # noqa: BLE001 — classified next line
+        # classified next line
+        except Exception as exc:  # noqa: BLE001
             if not is_transient(exc):
                 raise
             if attempt >= len(backoffs):

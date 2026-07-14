@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import uuid
 from contextlib import asynccontextmanager
@@ -11,44 +10,16 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.api import files, history, jobs, settings, sse, triggers, watch_folders, webhooks
+from app.api import asr_provider, files, history, jobs, settings, sse, triggers, watch_folders, webhooks
 from app.core.config import app_settings
 from app.core.security import ApiError
 from app.core.database import AsyncSessionLocal
 from app.models.orm import Settings
-from app.services.watcher import Watcher, WatcherService
+from app.services.watcher import Watcher
 
 logger = logging.getLogger(__name__)
 
 _API_V1_PREFIX = "/api/v1"
-
-
-async def _enqueue_detected_path(path: str) -> None:
-    """Async consumer for paths emitted by the watchdog thread.
-
-    Inserts a Job row with `source="watch_folder"` (the
-    JobRow renders an orange Auto badge for these), then dispatches the
-    Celery task. Defaults pulled from settings; target language falls back
-    to `en` since the model has no per-app default field yet.
-    """
-    from app.models.schemas import JobCreate
-    from app.services import job_service
-
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(text("SELECT * FROM settings WHERE id = 1"))
-        row = result.mappings().first()
-        if row is None:
-            logger.warning("Watcher: no settings row, dropping detected file %s", path)
-            return
-        payload = JobCreate(
-            file_path=path,
-            language=row.get("default_target_language") or "en",
-            translate=False,
-            source="watch_folder",
-        )
-        job = await job_service.enqueue_job(session, payload)
-
-    logger.info("Auto-enqueued watch-folder job: %s (id=%s)", path, job.id)
 
 
 @asynccontextmanager
@@ -63,19 +34,10 @@ async def lifespan(app: FastAPI):
         await session.execute(stmt)
         await session.commit()
 
-    # start the watchdog observer over the configured paths.
-    # The handler runs in watchdog's thread; we trampoline detected paths
-    # back onto the FastAPI event loop via run_coroutine_threadsafe.
-    main_loop = asyncio.get_running_loop()
-
-    def _on_detected(path: str) -> None:
-        # Called from the watchdog thread. Schedule the async enqueue on
-        # the main loop and don't block — the observer must keep ticking.
-        asyncio.run_coroutine_threadsafe(_enqueue_detected_path(path), main_loop)
-
-    watcher = WatcherService(_on_detected)
-    app.state.watcher = watcher
-    # watcher.start() moved to triggers-table-based bootstrap
+    # Legacy Story-8.1 WatcherService wiring removed (2026-07 audit): it was
+    # never started, and its enqueue path had drifted from JobCreate (a
+    # revival would have crashed). The Automations trigger-table Watcher
+    # below is the only file-watching producer.
 
     # Automations V1 — trigger-table Watcher. Without it, UI-created watch
     # triggers never fire (the producer side of the Automations feature).
@@ -86,11 +48,6 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        # Each stop runs independently so one failure doesn't shadow the other.
-        try:
-            watcher.stop()
-        except Exception:
-            logger.exception("legacy WatcherService stop failed")
         try:
             trigger_watcher.stop()
         except Exception:
@@ -162,6 +119,9 @@ app.include_router(history.router, prefix=_API_V1_PREFIX)
 app.include_router(watch_folders.router, prefix=_API_V1_PREFIX)
 app.include_router(triggers.router, prefix=_API_V1_PREFIX)
 app.include_router(webhooks.router, prefix=_API_V1_PREFIX)
+# Bazarr / whisper-asr-webservice protocol lives at the ROOT (no /api/v1):
+# Bazarr's whisper provider hardcodes POST /asr and /detect-language.
+app.include_router(asr_provider.router)
 
 _STATIC_DIR = Path("/app/static")
 

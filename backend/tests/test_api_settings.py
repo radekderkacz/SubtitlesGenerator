@@ -971,3 +971,54 @@ async def test_test_transcription_remote_resolves_masked_key_from_db(client, mak
     assert response.status_code == 200
     _, kwargs = http.post.call_args
     assert kwargs["headers"]["Authorization"] == "Bearer stored-whisper-key"
+
+
+# ---------------------------------------------------------------------------
+# WS5 (2026-07 audit): per-profile credential masking round-trip
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_settings_masks_profile_api_keys(client, make_settings_row):
+    """Profile API keys must never reach the browser raw."""
+    row = make_settings_row(profiles=[{
+        "name": "P1",
+        "transcription_api_key": "raw-trans-key",
+        "translation_api_key": "raw-transl-key",
+        "translation_provider": "openai",
+    }])
+    mock_factory, _ = _mock_session_with_row(row)
+    with patch("app.api.settings.AsyncSessionLocal", mock_factory):
+        response = await client.get("/api/v1/settings")
+    assert response.status_code == 200
+    profile = response.json()["profiles"][0]
+    assert profile["transcription_api_key"] == "***"
+    assert profile["translation_api_key"] == "***"
+    assert profile["translation_provider"] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_put_settings_resolves_masked_profile_keys(client, make_settings_row):
+    """A client round-tripping masked profiles must not store literal '***'
+    (which the worker would send as Authorization: Bearer *** — the exact
+    recurring-Google-400 class already fixed for top-level keys)."""
+    stored = make_settings_row(profiles=[{
+        "name": "P1",
+        "transcription_api_key": "stored-trans-key",
+        "translation_api_key": "stored-transl-key",
+    }])
+    mock_factory, mock_session = _mock_session_with_row(stored)
+    with patch("app.api.settings.AsyncSessionLocal", mock_factory):
+        response = await client.put("/api/v1/settings", json={"profiles": [{
+            "name": "P1",
+            "transcription_api_key": "***",
+            "translation_api_key": "new-key",
+        }]})
+    assert response.status_code == 200
+    stmt = mock_session.execute.await_args.args[0]
+    values = stmt.compile().params
+    import json as _json
+    profiles = values["profiles"]
+    if isinstance(profiles, str):
+        profiles = _json.loads(profiles)
+    assert profiles[0]["transcription_api_key"] == "stored-trans-key"  # unmasked
+    assert profiles[0]["translation_api_key"] == "new-key"             # replaced

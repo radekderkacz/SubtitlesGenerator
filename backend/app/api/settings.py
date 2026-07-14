@@ -44,6 +44,23 @@ _CREDENTIAL_FIELDS = frozenset(
 
 _NO_API_KEY_DETAIL = "API key not configured"
 
+# Per-profile secrets inside the Settings.profiles JSON list — masked on GET
+# and resolved from the stored row on PUT, exactly like the top-level fields
+# (2026-07 audit R11: these leaked raw and could be overwritten with "***").
+_PROFILE_CREDENTIAL_FIELDS = ("transcription_api_key", "translation_api_key")
+
+
+def _masked_profiles(profiles: list | None) -> list | None:
+    if not profiles:
+        return profiles
+    masked = []
+    for profile in profiles:
+        p = dict(profile)
+        for field in _PROFILE_CREDENTIAL_FIELDS:
+            p[field] = "***" if p.get(field) else None
+        masked.append(p)
+    return masked
+
 
 def _mask_credentials(row: Settings) -> SettingsResponse:
     data = {
@@ -52,7 +69,25 @@ def _mask_credentials(row: Settings) -> SettingsResponse:
     for field in _CREDENTIAL_FIELDS:
         val = data.get(field)
         data[field] = "***" if val else None
+    data["profiles"] = _masked_profiles(data.get("profiles"))
     return SettingsResponse.model_validate(data)
+
+
+async def _resolve_masked_profile_keys(profiles: list) -> list:
+    """Replace literal "***" placeholders in submitted profiles with the
+    stored values (matched by profile name), so a client round-tripping a
+    masked GET response can never store "***" as the actual key."""
+    async with AsyncSessionLocal() as session:
+        row = await session.get(Settings, 1)
+    stored = {p.get("name"): p for p in (row.profiles or [])} if row else {}
+    resolved = []
+    for profile in profiles:
+        p = dict(profile)
+        for field in _PROFILE_CREDENTIAL_FIELDS:
+            if p.get(field) == "***":
+                p[field] = (stored.get(p.get("name")) or {}).get(field)
+        resolved.append(p)
+    return resolved
 
 
 async def _resolve_provider_api_key(
@@ -206,6 +241,9 @@ async def put_settings(payload: SettingsUpdate, request: Request) -> JSONRespons
     for field in _CREDENTIAL_FIELDS:
         if update_dict.get(field) == "***":
             del update_dict[field]
+
+    if update_dict.get("profiles"):
+        update_dict["profiles"] = await _resolve_masked_profile_keys(update_dict["profiles"])
 
     if not update_dict:
         return JSONResponse(content={"status": "ok"})

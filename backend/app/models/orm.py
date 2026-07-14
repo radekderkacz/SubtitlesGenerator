@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -14,6 +14,19 @@ def _utcnow() -> datetime:
 
 class Job(Base):
     __tablename__ = "jobs"
+    # One ACTIVE job per file, enforced by the database: watcher, cron,
+    # webhook, and manual submissions racing on the same path collapse to a
+    # single queued/processing row (2026-07 audit R2). Terminal rows do not
+    # participate, so history keeps every run.
+    __table_args__ = (
+        Index(
+            "uq_jobs_active_file",
+            "file_path",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'processing')"),
+            sqlite_where=text("status IN ('queued', 'processing')"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(
         String, primary_key=True, default=lambda: str(uuid.uuid4())
@@ -103,6 +116,11 @@ class Trigger(Base):
     file_filter: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     webhook_secret: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # Stamped on every cron fire (even empty scans) so evaluation never
+    # depends on a TriggerEvent row existing — see cron_scheduler.
+    last_fired_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )

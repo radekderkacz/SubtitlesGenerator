@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, fireEvent } from '@testing-library/react'
 import { createMemoryRouter, RouterProvider } from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ApiRequestError, getJob, getJobLog, reverifyJob } from '@/lib/api'
@@ -127,6 +127,83 @@ describe('JobDetailPage', () => {
     expect(screen.getByRole('button', { name: /re-verify/i })).toBeInTheDocument()
   })
 
+  it('renders plain-language issues and collapses the rest', async () => {
+    vi.mocked(getJob).mockResolvedValue(
+      makeJob({
+        id: 'abc-123',
+        status: 'completed',
+        verification_status: 'warn',
+        verification_score: 80,
+        verification_report: {
+          summary: 'WARN — 0 fail, 1 warn across 10 checks',
+          checks: [
+            { layer: 'structural', name: 'non_empty', severity: 'ok', detail: '' },
+            { layer: 'structural', name: 'coverage', severity: 'ok', detail: 'subtitles cover 96% of runtime' },
+            { layer: 'heuristic', name: 'reading_speed', severity: 'warn', detail: '12/386 cues exceed 35.0 cps' },
+          ],
+        },
+      }),
+    )
+    vi.mocked(getJobLog).mockResolvedValue('')
+    vi.mocked(reverifyJob).mockResolvedValue(undefined)
+    renderJobDetail('abc-123')
+
+    expect(await screen.findByText('Worth a look')).toBeInTheDocument()
+    expect(screen.getByText(/Some lines may be fast to read/)).toBeInTheDocument()
+    expect(screen.getByText(/2 other checks passed/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /re-verify/i })).toBeInTheDocument()
+  })
+
+  it('shows raw check names under See all details', async () => {
+    vi.mocked(getJob).mockResolvedValue(
+      makeJob({
+        id: 'abc-123', status: 'completed', verification_status: 'warn', verification_score: 80,
+        verification_report: { summary: 's', checks: [
+          { layer: 'heuristic', name: 'reading_speed', severity: 'warn', detail: '12/386 cues exceed 35.0 cps' },
+        ] },
+      }),
+    )
+    vi.mocked(getJobLog).mockResolvedValue('')
+    renderJobDetail('abc-123')
+    // <details> content is in the DOM even when collapsed
+    expect(await screen.findByText('reading_speed')).toBeInTheDocument()
+  })
+
+  it('pass verdict shows green headline and no issue list', async () => {
+    vi.mocked(getJob).mockResolvedValue(
+      makeJob({
+        id: 'abc-123', status: 'completed', verification_status: 'pass', verification_score: 100,
+        verification_report: { summary: 'PASS', checks: [
+          { layer: 'structural', name: 'non_empty', severity: 'ok', detail: '' },
+        ] },
+      }),
+    )
+    vi.mocked(getJobLog).mockResolvedValue('')
+    renderJobDetail('abc-123')
+    expect(await screen.findByText('Looks good')).toBeInTheDocument()
+    expect(screen.getByText(/1 other check passed/)).toBeInTheDocument()
+  })
+
+  it('shows the repeated line evidence when a repeat_loop check carries it', async () => {
+    vi.mocked(getJob).mockResolvedValue(
+      makeJob({
+        id: 'abc-123', status: 'completed', verification_status: 'warn', verification_score: 70,
+        verification_report: { summary: 'WARN', checks: [
+          { layer: 'heuristic', name: 'repeat_loop', severity: 'warn',
+            detail: 'longest identical-line run: 48',
+            repeated: { text: '— Jimsy.', start: 2283, end: 2342, count: 48 } },
+        ] },
+      }),
+    )
+    vi.mocked(getJobLog).mockResolvedValue('')
+    renderJobDetail('abc-123')
+    const toggle = await screen.findByText(/show the repeated line/i)
+    fireEvent.click(toggle)
+    expect(screen.getByText(/— Jimsy\./)).toBeInTheDocument()
+    expect(screen.getByText(/48×/)).toBeInTheDocument()
+    expect(screen.getByText(/38:03/)).toBeInTheDocument()
+  })
+
   it('overlays a live verification verdict from the job store (post-Re-verify SSE)', async () => {
     // react-query snapshot has NO verdict yet (job completed before verification)
     vi.mocked(getJob).mockResolvedValue(
@@ -152,3 +229,60 @@ describe('JobDetailPage', () => {
     expect(screen.getByText(/longest run: 40/)).toBeInTheDocument()
   })
 })
+
+  it('renders the quality scorecard when the report carries metrics (WS11)', async () => {
+    vi.mocked(getJob).mockResolvedValue(
+      makeJob({
+        id: 'abc-123',
+        status: 'completed',
+        verification_status: 'pass',
+        verification_score: 100,
+        verification_report: {
+          summary: 'PASS',
+          checks: [{ layer: 'structural', name: 'non_empty', severity: 'ok', detail: '' }],
+          metrics: {
+            cue_count: 1284,
+            coverage_ratio: 0.87,
+            cps_p50: 12.1,
+            cps_p95: 22.4,
+            cps_max: 31.0,
+            pct_cues_over_20cps: 6.2,
+            min_duration: 0.91,
+            gaps_over_90s: 1,
+            max_gap: 112.4,
+          },
+        },
+      }),
+    )
+    vi.mocked(getJobLog).mockResolvedValue('')
+    renderJobDetail('abc-123')
+
+    const card = await screen.findByTestId('quality-scorecard')
+    expect(card).toBeInTheDocument()
+    expect(screen.getByText('22.4')).toBeInTheDocument()
+    expect(screen.getByText('87')).toBeInTheDocument()
+    expect(screen.getByText('1,284')).toBeInTheDocument()
+    // breached thresholds render in the alert tone
+    expect(screen.getByText('22.4').className).toContain('text-amber-400')
+    expect(screen.getByText('6.2').className).toContain('text-amber-400')
+    expect(screen.getByText('1,284').className).not.toContain('text-amber-400')
+  })
+
+  it('omits the scorecard when the report has no metrics (older jobs)', async () => {
+    vi.mocked(getJob).mockResolvedValue(
+      makeJob({
+        id: 'abc-123',
+        status: 'completed',
+        verification_status: 'pass',
+        verification_score: 100,
+        verification_report: {
+          summary: 'PASS',
+          checks: [{ layer: 'structural', name: 'non_empty', severity: 'ok', detail: '' }],
+        },
+      }),
+    )
+    vi.mocked(getJobLog).mockResolvedValue('')
+    renderJobDetail('abc-123')
+    await screen.findByRole('button', { name: /re-verify/i })
+    expect(screen.queryByTestId('quality-scorecard')).not.toBeInTheDocument()
+  })

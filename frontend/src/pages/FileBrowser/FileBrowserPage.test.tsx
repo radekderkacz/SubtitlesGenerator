@@ -21,6 +21,15 @@ vi.mock('@/lib/api', () => ({
   submitJob: vi.fn(),
 }))
 
+// BatchPanel and BatchSelectionStrip depend on router + react-query which are
+// already provided by renderPage(); no extra mocking needed.
+const MOCK_FILE = {
+  name: 'movie.mkv',
+  size_bytes: 1024,
+  modified_at: '2024-01-01T00:00:00Z',
+  has_srt: false,
+}
+
 function renderPage() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const router = createMemoryRouter(
@@ -39,6 +48,19 @@ beforeEach(() => {
 })
 
 describe('FileBrowserPage', () => {
+  it('bounds the page to the viewport so columns scroll independently', () => {
+    vi.mocked(browseDirectory).mockResolvedValue({
+      path: '/media',
+      parent: null,
+      directories: [],
+      files: [],
+    })
+    const { container } = renderPage()
+    const root = container.querySelector('div')!
+    expect(root.className).not.toMatch(/min-h-screen/)
+    expect(root.className).toMatch(/h-\[100dvh\]|h-screen|h-full/)
+  })
+
   it('renders the FILE SYSTEM caption header and the empty selection state', async () => {
     vi.mocked(browseDirectory).mockResolvedValue({
       path: '/media',
@@ -92,5 +114,45 @@ describe('FileBrowserPage', () => {
     // Subdirectory entries
     expect(screen.getByText('films')).toBeInTheDocument()
     expect(screen.getByText('tv')).toBeInTheDocument()
+  })
+
+  it('selecting a file shows the BatchSelectionStrip and BatchPanel in the right rail', async () => {
+    // Root browse: one directory entry so it appears in DirectoryTree
+    vi.mocked(browseDirectory).mockResolvedValueOnce({
+      path: '/media',
+      parent: null,
+      directories: ['films'],
+      files: [],
+    })
+    // Directory browse (triggered when user clicks 'films'): one video file
+    vi.mocked(browseDirectory).mockResolvedValue({
+      path: '/media/films',
+      parent: '/media',
+      directories: [],
+      files: [MOCK_FILE],
+    })
+    renderPage()
+
+    // Click 'films' in the directory tree to set selectedPath = '/media/films'
+    const folderBtn = await screen.findByRole('button', { name: 'films' })
+    fireEvent.click(folderBtn)
+
+    // Wait for the file row checkbox to appear
+    const checkbox = await screen.findByRole('checkbox', {
+      name: /Select movie\.mkv for batch submission/i,
+    })
+    fireEvent.click(checkbox)
+
+    // (a) Slim strip: shows "N selected" and a Clear button
+    // (BatchSelectionStrip and BatchActionBar both render this text; assert at least one)
+    await waitFor(() => {
+      const matches = screen.getAllByText(/1 files? selected/i)
+      expect(matches.length).toBeGreaterThan(0)
+    })
+    const clearBtns = screen.getAllByRole('button', { name: /clear/i })
+    expect(clearBtns.length).toBeGreaterThan(0)
+
+    // (b) BatchPanel heading in the right rail
+    expect(screen.getByText(/Generate for 1 file/i)).toBeInTheDocument()
   })
 })

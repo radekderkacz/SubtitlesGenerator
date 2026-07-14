@@ -1,4 +1,7 @@
+from unittest.mock import MagicMock, patch
+
 from app.worker.subtitle_verify import sample_cues, build_judge_prompt, parse_judge_response
+from app.worker.subtitle_verify_judge import judge_semantics
 
 
 def _cues(n):
@@ -67,3 +70,34 @@ def test_parse_judge_recovers_score_from_malformed_json():
     c = parse_judge_response(raw)
     assert c["severity"] == "warn"           # 55 -> warn
     assert "55" in c["detail"]
+
+
+def _judge_mock_client(content: str):
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {"choices": [{"message": {"content": content}}]}
+    client = MagicMock()
+    client.post.return_value = resp
+    client.__enter__ = MagicMock(return_value=client)
+    client.__exit__ = MagicMock(return_value=None)
+    return client
+
+
+def test_judge_request_pins_zero_temperature():
+    cues = [{"index": 1, "start": 0.0, "end": 1.0, "text": "Hello"}]
+    mock_client = _judge_mock_client('{"score": 90, "verdict": "ok", "issues": []}')
+    with patch("httpx.Client", return_value=mock_client):
+        judge_semantics(cues, None, {"mapped_model": "ollama/x", "base_url": "http://x"})
+    body = mock_client.post.call_args.kwargs["json"]
+    assert body["temperature"] == 0
+
+
+def test_judge_outage_with_configured_model_warns_not_passes():
+    """WS4: a configured-but-unreachable judge must surface as warn —
+    'skipped' ranks as ok and silently upgraded outages to passes."""
+    from app.worker.subtitle_verify_judge import judge_semantics
+    cues = [{"index": 1, "start": 0.0, "end": 2.0, "text": "Hello."}]
+    # mapped_model resolves but the endpoint is unreachable -> exception path
+    check = judge_semantics(cues, None, {"mapped_model": "openai/x", "base_url": "http://127.0.0.1:1"})
+    assert check["severity"] == "warn"
+    assert "unverified" in check["detail"]

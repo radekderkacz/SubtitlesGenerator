@@ -12,6 +12,7 @@ import {
   getWatchFolderActivity,
   listHistory,
   refreshJellyfin,
+  regenerateJob,
   retryJob,
   stopAllJobs,
   submitJob,
@@ -196,6 +197,12 @@ describe('endpoint helpers route to the right URL + method', () => {
       'retryJob',
       () => retryJob('abc'),
       '/api/v1/jobs/abc/retry',
+      'POST',
+    ],
+    [
+      'regenerateJob',
+      () => regenerateJob('abc-123'),
+      '/api/v1/jobs/abc-123/regenerate',
       'POST',
     ],
   ] as const)('%s → %s %s', async (_name, call, expectedUrl, expectedMethod) => {

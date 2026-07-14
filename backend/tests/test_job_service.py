@@ -475,6 +475,7 @@ async def test_dispatch_event_triggers_celery_via_enqueue_job(monkeypatch):
     exec_result.scalar_one_or_none = MagicMock(
         return_value=_settings([{"name": "P1", "transcription_backend": "remote-api"}])
     )
+    exec_result.first = MagicMock(return_value=None)  # no active duplicate (WS5)
     session.execute = AsyncMock(return_value=exec_result)
 
     from unittest.mock import patch as _patch
@@ -556,3 +557,123 @@ async def test_retry_carries_backend_profile_and_languages(mock_session_factory)
     assert new.file_path == "/m/x.mkv"
     assert new.id != "orig"
     assert new.status == JobStatus.queued
+
+
+# ---------------------------------------------------------------------------
+# regenerate_job
+# ---------------------------------------------------------------------------
+
+def _regen_session(job):
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=job)
+    result = MagicMock()
+    result.first = MagicMock(return_value=None)
+    session.execute = AsyncMock(return_value=result)
+    session.add = MagicMock()
+    session.commit = AsyncMock()
+    session.refresh = AsyncMock()
+    return session
+
+
+def _job(**kw):
+    base = dict(id="src", file_path="/media/Movie/A.mkv", source_language="en",
+                target_language="pl", backend_profile={"translation_model": "gemma3:27b"},
+                status=JobStatus.completed)
+    base.update(kw)
+    return Job(**base)
+
+
+@pytest.mark.asyncio
+async def test_regenerate_clones_terminal_job_with_snapshot():
+    src = _job()
+    session = _regen_session(src)
+    new = await job_service.regenerate_job(session, "src")
+    session.add.assert_called_once()
+    added = session.add.call_args.args[0]
+    assert added.file_path == "/media/Movie/A.mkv"
+    assert added.target_language == "pl"
+    assert added.backend_profile == {"translation_model": "gemma3:27b"}
+    assert added.status == JobStatus.queued
+    assert added.id != "src"
+    assert new is added
+
+
+@pytest.mark.asyncio
+async def test_regenerate_not_found():
+    session = _regen_session(None)
+    with pytest.raises(job_service.RegenerateError) as e:
+        await job_service.regenerate_job(session, "nope")
+    assert e.value.code == "JOB_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_regenerate_rejects_non_terminal():
+    session = _regen_session(_job(status=JobStatus.processing))
+    with pytest.raises(job_service.RegenerateError) as e:
+        await job_service.regenerate_job(session, "src")
+    assert e.value.code == "JOB_NOT_TERMINAL"
+    session.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_regenerate_rejects_active_duplicate():
+    session = _regen_session(_job())
+    dup = MagicMock(); dup.first = MagicMock(return_value=("other-id",))
+    session.execute = AsyncMock(return_value=dup)
+    with pytest.raises(job_service.RegenerateError) as e:
+        await job_service.regenerate_job(session, "src")
+    assert e.value.code == "ALREADY_ACTIVE"
+    session.add.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# WS5 (2026-07 audit): duplicate-job protection
+# ---------------------------------------------------------------------------
+
+def _session_for_enqueue(profiles):
+    session = AsyncMock()
+    settings_row = MagicMock()
+    settings_row.profiles = profiles
+    exec_result = MagicMock()
+    exec_result.scalar_one_or_none = MagicMock(return_value=settings_row)
+    exec_result.first = MagicMock(return_value=None)  # no active dup by default
+    session.execute = AsyncMock(return_value=exec_result)
+    session.add = MagicMock()
+    session.commit = AsyncMock()
+    session.refresh = AsyncMock()
+    session.rollback = AsyncMock()
+    return session
+
+
+@pytest.mark.asyncio
+async def test_enqueue_integrity_error_raises_duplicate(monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+    session = _session_for_enqueue([{"name": "P1"}])
+    session.commit = AsyncMock(side_effect=IntegrityError("dup", None, Exception("uq")))
+    payload = JobCreate(file_path="/media/Foo.mkv", profile_name="P1",
+                        source_language="auto", translate=False)
+    with pytest.raises(job_service.DuplicateJobError):
+        await job_service.enqueue_job(session, payload, dispatch=False)
+    session.rollback.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enqueue_precheck_rejects_active_duplicate():
+    session = _session_for_enqueue([{"name": "P1"}])
+    # settings query returns the row; the duplicate pre-check returns a hit
+    settings_result = MagicMock()
+    settings_row = MagicMock(); settings_row.profiles = [{"name": "P1"}]
+    settings_result.scalar_one_or_none = MagicMock(return_value=settings_row)
+    dup_result = MagicMock(); dup_result.first = MagicMock(return_value=("some-id",))
+    session.execute = AsyncMock(side_effect=[settings_result, dup_result])
+    payload = JobCreate(file_path="/media/Foo.mkv", profile_name="P1",
+                        source_language="auto", translate=False)
+    with pytest.raises(job_service.DuplicateJobError):
+        await job_service.enqueue_job(session, payload, dispatch=False)
+
+
+@pytest.mark.asyncio
+async def test_stuck_queued_threshold_exceeds_max_retry_backoff():
+    """WS5: manual retry must not be invited while an auto-retry countdown
+    (up to 900s) is pending — that path double-ran jobs."""
+    assert job_service.STUCK_QUEUED_THRESHOLD_SECONDS > 900

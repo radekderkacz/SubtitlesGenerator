@@ -17,6 +17,15 @@ celery_app.conf.update(
     worker_concurrency=1,
     worker_prefetch_multiplier=1,
     task_acks_late=True,
+    # Redis' default visibility_timeout is 3600s (1h). With acks_late=True a task
+    # that runs longer than it is assumed-dead by the broker and RE-DELIVERED —
+    # which silently restarted feature-length movie jobs from audio extraction
+    # around the ~1h mark (mid cue-by-cue translation; prod incident 2026-06-20).
+    # Set it far above the longest plausible job (a full movie translated locally
+    # can run several hours). Genuine worker crashes are still recovered promptly
+    # by orphan_recovery's worker_ready sweep on boot — NOT by this timeout — so
+    # a large value costs nothing on the crash path.
+    broker_transport_options={"visibility_timeout": 86400},  # 24h
     # Respawn the worker child after every task. Long-running pipeline
     # tasks accumulate per-process state (open NFS handles, HTTP client
     # pools, ffmpeg subprocess remnants) — on 2026-05-29, 9 consecutive

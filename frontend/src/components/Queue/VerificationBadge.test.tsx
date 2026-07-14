@@ -7,16 +7,21 @@ describe('VerificationBadge', () => {
     const { container } = render(<VerificationBadge status={null} />)
     expect(container).toBeEmptyDOMElement()
   })
-  it('shows pass', () => {
-    render(<VerificationBadge status="pass" />)
-    expect(screen.getByText(/verified/i)).toBeInTheDocument()
+  it('shows friendly pass label and no numeric score', () => {
+    render(<VerificationBadge status="pass" score={95} />)
+    expect(screen.getByText('Looks good')).toBeInTheDocument()
+    expect(screen.queryByText(/95/)).not.toBeInTheDocument()
   })
-  it('shows fail', () => {
+  it('shows friendly warn label', () => {
+    render(<VerificationBadge status="warn" />)
+    expect(screen.getByText('Worth a look')).toBeInTheDocument()
+  })
+  it('shows friendly fail label', () => {
     render(<VerificationBadge status="fail" />)
-    expect(screen.getByText(/failed/i)).toBeInTheDocument()
+    expect(screen.getByText('Needs attention')).toBeInTheDocument()
   })
-  it('shows verifying', () => {
+  it('shows checking label for running', () => {
     render(<VerificationBadge status="running" />)
-    expect(screen.getByText(/verifying/i)).toBeInTheDocument()
+    expect(screen.getByText('Checking…')).toBeInTheDocument()
   })
 })

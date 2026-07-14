@@ -1,10 +1,12 @@
 import { useState } from 'react'
-import { Check, Copy } from 'lucide-react'
+import { Check, Copy, RotateCcw } from 'lucide-react'
 import { useNavigate } from 'react-router'
 import ColorPillBadge from '@/components/Queue/ColorPillBadge'
 import VerificationBadge from '@/components/Queue/VerificationBadge'
 import RowActionsMenu from './RowActionsMenu'
 import { basename, formatDuration } from '@/lib/utils'
+import { regenerateJob } from '@/lib/api'
+import { withApiToast } from '@/lib/apiToast'
 import type { HistoryEntry, TerminalStatus } from '@/types/api'
 
 type Props = Readonly<{
@@ -183,10 +185,10 @@ type SrtPathCellProps = Readonly<{ entry: HistoryEntry }>
 function SrtPathCell({ entry }: SrtPathCellProps) {
   const [copied, setCopied] = useState(false)
   const path = entry.srt_path
-  if (!path) return <span className="text-xs text-muted-foreground">—</span>
 
   const handleCopy = async (e: React.MouseEvent) => {
     e.stopPropagation()
+    if (!path) return
     try {
       await navigator.clipboard.writeText(path)
       setCopied(true)
@@ -198,19 +200,36 @@ function SrtPathCell({ entry }: SrtPathCellProps) {
 
   return (
     <div className="flex items-center gap-2 max-w-[260px]">
-      <span
-        className="font-mono text-[11px] text-foreground truncate"
-        title={path}
-      >
-        {basename(path)}
-      </span>
+      {path ? (
+        <>
+          <span
+            className="font-mono text-[11px] text-foreground truncate"
+            title={path}
+          >
+            {basename(path)}
+          </span>
+          <button
+            type="button"
+            aria-label={`Copy SRT path for ${basename(entry.file_path)}`}
+            onClick={handleCopy}
+            className="text-muted-foreground hover:text-foreground transition-colors shrink-0 p-0.5 rounded focus:outline-none focus:ring-2 focus:ring-primary/50"
+          >
+            {copied ? <Check className="h-3.5 w-3.5" aria-hidden="true" /> : <Copy className="h-3.5 w-3.5" aria-hidden="true" />}
+          </button>
+        </>
+      ) : (
+        <span className="text-xs text-muted-foreground">—</span>
+      )}
       <button
         type="button"
-        aria-label={`Copy SRT path for ${basename(entry.file_path)}`}
-        onClick={handleCopy}
+        aria-label={`Regenerate subtitles for ${basename(entry.file_path)}`}
+        onClick={(e) => {
+          e.stopPropagation()
+          void withApiToast(() => regenerateJob(entry.id), { successMessage: 'Regeneration queued' })
+        }}
         className="text-muted-foreground hover:text-foreground transition-colors shrink-0 p-0.5 rounded focus:outline-none focus:ring-2 focus:ring-primary/50"
       >
-        {copied ? <Check className="h-3.5 w-3.5" aria-hidden="true" /> : <Copy className="h-3.5 w-3.5" aria-hidden="true" />}
+        <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
       </button>
     </div>
   )

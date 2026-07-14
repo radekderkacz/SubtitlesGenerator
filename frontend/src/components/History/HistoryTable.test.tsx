@@ -4,6 +4,14 @@ import { createMemoryRouter, RouterProvider, useLocation } from 'react-router'
 import HistoryTable from './HistoryTable'
 import type { HistoryEntry } from '@/types/api'
 
+vi.mock('@/lib/api', () => ({
+  regenerateJob: vi.fn(),
+}))
+
+vi.mock('@/lib/apiToast', () => ({
+  withApiToast: vi.fn((fn: () => Promise<unknown>) => fn()),
+}))
+
 function makeEntry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
   const created = '2026-04-24T09:14:00Z'
   return {
@@ -87,8 +95,7 @@ describe('HistoryTable', () => {
 
   it('renders the verification badge when the entry has a verdict', () => {
     renderWithRouter([makeEntry({ verification_status: 'pass', verification_score: 95 })])
-    // badge shows "Verified 95" (distinct from the plain "Verified" column header)
-    expect(screen.getByText(/verified 95/i)).toBeInTheDocument()
+    expect(screen.getByText('Looks good')).toBeInTheDocument()
   })
 
   it('shows — for SRT path when the entry has none', () => {
@@ -118,6 +125,19 @@ describe('HistoryTable', () => {
     const row = screen.getByText('Foo.mkv').closest('tr')!
     fireEvent.click(row)
     expect(screen.getByTestId('route').textContent).toBe('/jobs/abc-123')
+  })
+
+  it('Regenerate button calls regenerateJob with the entry id', async () => {
+    const { regenerateJob } = await import('@/lib/api')
+    vi.mocked(regenerateJob).mockResolvedValue(undefined)
+    renderWithRouter([makeEntry({ id: 'job-9' })])
+    fireEvent.click(screen.getByLabelText(/regenerate/i))
+    expect(regenerateJob).toHaveBeenCalledWith('job-9')
+  })
+
+  it('Regenerate button shows even when the row has no SRT (failed/cancelled)', () => {
+    renderWithRouter([makeEntry({ id: 'job-x', status: 'failed', srt_path: null })])
+    expect(screen.getByLabelText(/regenerate/i)).toBeInTheDocument()
   })
 
   it('renders provider, model, tokens and the three cost states', () => {

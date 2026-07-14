@@ -92,6 +92,14 @@ services:
     # shutdown a chance to either finish the in-flight task or cleanly reject
     # it back to the broker for re-delivery on the next boot.
     stop_grace_period: 90s
+    # A wedged worker (D-state ffmpeg on a hung NFS mount) looks alive to
+    # Docker without this — the queue backs up silently (2026-07 audit).
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.worker.celery_app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 10 || exit 1"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 60s
     labels:
       # Auto-updated by Watchtower. IMPORTANT: Watchtower stops containers with
       # its own WATCHTOWER_TIMEOUT (default 10s) and ignores the 90s
@@ -126,11 +134,17 @@ services:
 
   redis:
     image: redis:7-alpine
+    # AOF persistence: without it a broker restart loses every queued Celery
+    # message (and every scheduled auto-retry) while the DB rows stay
+    # `queued` forever (2026-07 audit R7).
+    command: ["redis-server", "--appendonly", "yes"]
     restart: unless-stopped
     labels:
       # Data/infra service — excluded from Watchtower so the broker isn't
       # recreated out from under in-flight jobs on an unrelated image bump.
       - "com.centurylinklabs.watchtower.enable=false"
+    volumes:
+      - ./data/redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s

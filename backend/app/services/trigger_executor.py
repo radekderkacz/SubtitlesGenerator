@@ -25,7 +25,8 @@ from app.models.schemas import JobCreate
 from redis.exceptions import RedisError
 
 from app.services.job_events import publish_job_update
-from app.services.job_service import enqueue_job
+from app.services.job_service import DuplicateJobError, enqueue_job
+from app.services.watcher import has_sibling_srt
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,14 @@ async def dispatch_event(session: AsyncSession, evt: MatchEvent) -> str:
                             outcome="skipped_no_rule", job_id=None, error=None)
         return "skipped_no_rule"
 
+    # Idempotency gates every producer inherits (2026-07 audit R1/R2): a file
+    # that already has subtitles, or already has an active job, is a no-op —
+    # this is what makes periodic cron re-scans of a whole library safe.
+    if has_sibling_srt(evt.file_path):
+        await _record_event(session, evt, matched_rule_index=None,
+                            outcome="skipped_existing_srt", job_id=None, error=None)
+        return "skipped_existing_srt"
+
     action = trig.action or {}
     profile = action.get("profile_name")
     if not profile or not await _profile_exists(session, profile):
@@ -146,7 +155,13 @@ async def dispatch_event(session: AsyncSession, evt: MatchEvent) -> str:
         target_language=action.get("target_language"),
         source=f"trigger:{trig.id}",
     )
-    job = await enqueue_job(session, payload)
+    try:
+        job = await enqueue_job(session, payload)
+    except DuplicateJobError:
+        # The DB unique index caught a race the pre-check missed.
+        await _record_event(session, evt, matched_rule_index=None,
+                            outcome="skipped_duplicate", job_id=None, error=None)
+        return "skipped_duplicate"
     # Surface the new queued job on the live Queue immediately (the SSE stream
     # is persistent and isn't refetched on navigation). Best-effort: the row is
     # already committed, so a Redis hiccup must not fail the dispatch.

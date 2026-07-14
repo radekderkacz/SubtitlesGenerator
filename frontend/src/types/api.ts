@@ -1,3 +1,15 @@
+export type VerificationMetrics = Readonly<{
+  cue_count: number
+  coverage_ratio: number | null
+  cps_p50: number
+  cps_p95: number
+  cps_max: number
+  pct_cues_over_20cps: number
+  min_duration: number
+  gaps_over_90s: number
+  max_gap: number
+}>
+
 export const JOB_STATUS = {
   QUEUED: 'queued',
   PROCESSING: 'processing',
@@ -49,7 +61,7 @@ export type Job = {
   jellyfin_refreshed_at: string | null
   verification_status: VerificationStatus | null
   verification_score: number | null
-  verification_report: { summary: string; checks: Array<{ layer: string; name: string; severity: string; detail: string }> } | null
+  verification_report: { summary: string; checks: Array<{ layer: string; name: string; severity: string; detail: string; repeated?: { text: string; start: number; end: number; count: number } }>; metrics?: VerificationMetrics | null } | null
   verified_at: string | null
 }
 
@@ -64,7 +76,7 @@ export type JobUpdatePayload = Pick<
   // Verification fields — present on verification events, absent on others.
   verification_status?: VerificationStatus | null
   verification_score?: number | null
-  verification_report?: { summary: string; checks: Array<{ layer: string; name: string; severity: string; detail: string }> } | null
+  verification_report?: { summary: string; checks: Array<{ layer: string; name: string; severity: string; detail: string; repeated?: { text: string; start: number; end: number; count: number } }>; metrics?: VerificationMetrics | null } | null
   verified_at?: string | null
 }
 

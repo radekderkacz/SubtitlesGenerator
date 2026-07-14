@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 # Configurable cap (env override) so a misconfigured scan_path can't blow up
 # the worker. Excess files → skipped_scan_limit events, one per excess.
 MAX_FILES_PER_FIRE = int(os.environ.get("AUTOMATIONS_CRON_SCAN_LIMIT", "500"))
+# A video whose mtime is younger than this is assumed to still be copying —
+# transcribing a half-copied file "completes" with subtitles for a fraction
+# of the movie. The next scheduled scan picks it up once it settles.
+CRON_MIN_FILE_AGE_SECONDS = 60.0
 
 
 def schedule_to_cron(schedule: dict) -> str:
@@ -96,6 +100,25 @@ async def _record_skipped_scan_limit(
         await session.commit()
 
 
+def _is_still_copying(fp: str, now: datetime) -> bool:
+    """True when the file was modified within the settle window (a copy in
+    progress). Stat failures count as settled — dispatch_event re-validates."""
+    try:
+        return now.timestamp() - os.path.getmtime(fp) < CRON_MIN_FILE_AGE_SECONDS
+    except OSError:
+        return False
+
+
+async def _stamp_last_fired(trigger_id: str, now: datetime) -> None:
+    """Record the fire on the trigger row itself, so a scan that dispatched
+    nothing still counts as fired (no TriggerEvent row exists to prove it)."""
+    async with _SessionLocal() as session:
+        row = await session.get(Trigger, trigger_id)
+        if row is not None:
+            row.last_fired_at = now
+            await session.commit()
+
+
 async def _fire_cron_trigger(trig: Trigger, now: datetime) -> None:
     scan_path = trig.config["scan_path"]
     fired = 0
@@ -107,6 +130,11 @@ async def _fire_cron_trigger(trig: Trigger, now: datetime) -> None:
                 # .jpg, .nfo) are silently skipped — no event row, and they
                 # do not consume the scan-limit budget.
                 if not is_video_file(fp):
+                    continue
+                if _is_still_copying(fp, now):
+                    logger.info("cron %s: %s modified <%ss ago — still copying, "
+                                "next scan picks it up", trig.id, fp,
+                                int(CRON_MIN_FILE_AGE_SECONDS))
                     continue
                 if fired >= MAX_FILES_PER_FIRE:
                     await _record_skipped_scan_limit(trig.id, fp, scan_path)
@@ -123,6 +151,7 @@ async def _fire_cron_trigger(trig: Trigger, now: datetime) -> None:
                     ),
                 )
                 fired += 1
+    await _stamp_last_fired(trig.id, now)
 
 
 async def _evaluate_async(now: datetime) -> None:
@@ -130,6 +159,11 @@ async def _evaluate_async(now: datetime) -> None:
     for trig in triggers:
         try:
             last = await _last_fire_at(trig.id)
+            # The row stamp covers fires whose scan dispatched nothing (no
+            # TriggerEvent exists for those).
+            stamp = getattr(trig, "last_fired_at", None)
+            if isinstance(stamp, datetime) and (last is None or stamp > last):
+                last = stamp
             # When no prior fire: assume the trigger was "just enabled" and
             # should fire this minute — subtract 1m so get_next() <= now.
             base = last or (now.replace(second=0, microsecond=0) - timedelta(minutes=1))
@@ -137,7 +171,9 @@ async def _evaluate_async(now: datetime) -> None:
             if nxt > now:
                 continue
             await _fire_cron_trigger(trig, now)
-        except (DBAPIError, ValueError, OSError) as exc:
+        except (DBAPIError, ValueError, OSError, KeyError) as exc:
+            # KeyError: a malformed config (missing cron/scan_path) must not
+            # halt evaluation of the remaining triggers (2026-07 audit R9).
             logger.error(
                 "cron_scheduler: trigger %s evaluation failed: %s", trig.id, exc
             )

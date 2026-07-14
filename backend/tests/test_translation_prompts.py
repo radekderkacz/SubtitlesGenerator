@@ -3,6 +3,8 @@ from app.worker.translation_prompts import (
     CONTEXT_WINDOW_SIZE,
     LANGUAGE_OVERLAYS,
     UNIVERSAL_RULES,
+    build_batch_system_prompt,
+    build_batch_user_prompt,
     build_glossary_extraction_prompt,
     build_system_prompt,
     build_user_prompt,
@@ -94,8 +96,8 @@ def test_build_system_prompt_handles_none_or_empty_language():
 def test_build_user_prompt_includes_the_source_text():
     out = build_user_prompt("Hello world", "pl")
     assert "Hello world" in out
-    # Tells the model what target language to use.
-    assert "pl" in out.lower()
+    # Tells the model what target language to use (full name since WS3).
+    assert "polish" in out.lower()
     # Reminds the model to output only the translation.
     assert "only" in out.lower()
 
@@ -158,7 +160,8 @@ def test_build_system_prompt_handles_empty_glossary():
     out_none = build_system_prompt("pl", glossary=None)
     out_empty = build_system_prompt("pl", glossary=[])
     assert out_none == out_empty
-    assert "GLOSSARY" not in out_empty
+    # No glossary BLOCK is appended (rule 9 may mention the word itself).
+    assert "GLOSSARY —" not in out_empty
 
 
 def test_build_system_prompt_deduplicates_glossary_terms():
@@ -214,3 +217,127 @@ def test_context_window_size_is_a_sane_default():
     call into a 1k-token prompt for a 20-token answer.
     """
     assert 1 <= CONTEXT_WINDOW_SIZE <= 5
+
+
+def test_batch_system_prompt_extends_per_cue_rules_with_list_contract():
+    s = build_batch_system_prompt("pl", glossary=["Na'vi"])
+    assert build_system_prompt("pl", glossary=["Na'vi"]) in s
+    assert "numbered" in s.lower()
+    assert "Na'vi" in s
+
+
+def test_batch_user_prompt_numbers_each_line():
+    u = build_batch_user_prompt(["Hello.", "How are you?"], "pl")
+    assert "1. Hello." in u
+    assert "2. How are you?" in u
+
+
+def test_batch_user_prompt_includes_context_pairs():
+    u = build_batch_user_prompt(["Hi."], "pl", context_pairs=[("Run!", "Biegnij!")])
+    assert "Run!" in u and "Biegnij!" in u
+
+
+def test_batch_user_prompt_flattens_multiline_source():
+    u = build_batch_user_prompt(["line one\nline two"], "pl")
+    assert "1. line one line two" in u
+
+
+# ---------------------------------------------------------------------------
+# WS3 (2026-07 audit): language names, cross-cue context, dialogue/ASR rules
+# ---------------------------------------------------------------------------
+
+def test_language_name_maps_iso1_to_english_name():
+    from app.worker.translation_prompts import language_name
+    assert language_name("pl") == "Polish"
+    assert language_name("PL") == "Polish"
+    assert language_name("xx") == "xx"
+    assert language_name(None) == ""
+
+
+def test_prompts_use_full_language_names():
+    out = build_user_prompt("Hello", "pl")
+    assert "Polish" in out
+    bout = build_batch_user_prompt(["Hello"], "pl")
+    assert "Polish" in bout
+
+
+def test_context_pairs_label_uses_source_language_name():
+    pairs = [("Hej", "Hallo")]
+    out = build_batch_user_prompt(["Cześć"], "de", context_pairs=pairs, source_language="pl")
+    assert "POLISH:" in out
+    assert "EN:" not in out
+    per_cue = build_user_prompt("Cześć", "de", context_pairs=pairs, source_language="pl")
+    assert "POLISH:" in per_cue
+
+
+def test_context_pairs_label_falls_back_to_source():
+    out = build_batch_user_prompt(["Hi"], "de", context_pairs=[("a", "b")], source_language=None)
+    assert "SOURCE:" in out
+    assert "EN:" not in out
+
+
+def test_batch_contract_demands_cross_cue_context():
+    from app.worker.translation_prompts import BATCH_OUTPUT_CONTRACT
+    low = BATCH_OUTPUT_CONTRACT.lower()
+    assert "independently" not in low
+    assert "gender" in low
+    assert "pronoun" in low
+    assert "formality" in low
+
+
+def test_universal_rules_cover_dialogue_music_and_asr_tolerance():
+    low = UNIVERSAL_RULES.lower()
+    assert "♪" in UNIVERSAL_RULES
+    assert "dialogue" in low
+    assert "speech-recognition" in low or "speech recognition" in low
+    assert "fragment" in low
+
+
+def test_context_window_is_three():
+    assert CONTEXT_WINDOW_SIZE == 3
+
+
+# ---------------------------------------------------------------------------
+# WS8 (2026-07 audit): film bible + story-so-far context
+# ---------------------------------------------------------------------------
+
+def test_bible_extraction_prompt_asks_for_structured_json():
+    from app.worker.translation_prompts import build_bible_extraction_prompt
+    system, user = build_bible_extraction_prompt("JAKE: Get down!\nNEYTIRI: Run.", "pl")
+    low = (system + user).lower()
+    assert "json" in low
+    assert "character" in low
+    assert "gender" in low
+    assert "register" in low
+    assert "JAKE: Get down!" in user
+
+
+def test_system_prompt_renders_bible_blocks():
+    bible = {
+        "names": ["Pandora", "Na'vi"],
+        "characters": [{"name": "Jake", "gender": "male"},
+                       {"name": "Neytiri", "gender": "female"}],
+        "terms": {"the Colonel": "Pułkownik"},
+        "setting": "Military sci-fi on an alien moon.",
+        "register": "informal military banter",
+    }
+    out = build_system_prompt("pl", glossary=["Pandora", "Na'vi"], bible=bible)
+    assert "Jake (male)" in out
+    assert "Neytiri (female)" in out
+    assert "the Colonel" in out and "Pułkownik" in out
+    assert "Military sci-fi" in out
+    assert "informal military banter" in out
+    # prefix-cache stability: universal rules still lead
+    assert out.startswith(UNIVERSAL_RULES.split("\n")[0])
+
+
+def test_system_prompt_without_bible_unchanged():
+    assert build_system_prompt("pl", glossary=["X"]) == build_system_prompt(
+        "pl", glossary=["X"], bible=None)
+
+
+def test_batch_user_prompt_carries_story_so_far():
+    out = build_batch_user_prompt(["Line one."], "pl",
+                                  story_so_far="Jake infiltrated the base.")
+    assert "STORY SO FAR" in out
+    assert "Jake infiltrated the base." in out

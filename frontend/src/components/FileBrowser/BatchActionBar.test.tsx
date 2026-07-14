@@ -146,7 +146,9 @@ describe('BatchActionBar', () => {
     expect(vi.mocked(submitJob).mock.calls[0][0].file_path).toBe('/b.mkv')
   })
 
-  it('carries translate + target language per file (skip OFF)', async () => {
+  // Generous timeout: this spec renders the full bar + profile picker and
+  // has timed out at the default 5s on a loaded CI runner (2026-07-13).
+  it('carries translate + target language per file (skip OFF)', { timeout: 20000 }, async () => {
     const { submitJob } = await import('@/lib/api')
     renderBar()
     await pickProfile()

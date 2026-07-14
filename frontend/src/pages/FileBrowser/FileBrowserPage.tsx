@@ -4,6 +4,8 @@ import { Filter, LayoutGrid, RefreshCw } from 'lucide-react'
 import DirectoryTree from '@/components/FileBrowser/DirectoryTree'
 import FileList from '@/components/FileBrowser/FileList'
 import BatchActionBar from '@/components/FileBrowser/BatchActionBar'
+import BatchPanel from '@/components/FileBrowser/BatchPanel'
+import BatchSelectionStrip from '@/components/FileBrowser/BatchSelectionStrip'
 import SubmitSheet from '@/components/SubmitSheet/SubmitSheet'
 import GenerationPanel from '@/components/SubmitSheet/GenerationPanel'
 import type { FileBrowseEntry } from '@/types/api'
@@ -69,11 +71,11 @@ export default function FileBrowserPage(_props: Props) {
   const folderName = selectedPath?.split('/').pop() ?? selectedPath ?? null
 
   return (
-    <div className="flex min-h-screen">
+    <div className="flex h-[100dvh] overflow-hidden">
       {/* LOCATIONS pane */}
       <aside
         aria-label="Locations"
-        className="w-64 shrink-0 border-r border-border bg-popover overflow-y-auto"
+        className="w-64 shrink-0 border-r border-border bg-popover overflow-y-auto min-h-0"
       >
         <header className="p-4 sticky top-0 bg-popover/90 backdrop-blur z-10 flex items-center justify-between">
           <h1 className="text-xs uppercase tracking-widest text-muted-foreground font-semibold">
@@ -94,7 +96,7 @@ export default function FileBrowserPage(_props: Props) {
       </aside>
 
       {/* File list pane */}
-      <section className="flex-1 flex flex-col bg-background overflow-hidden">
+      <section className="flex-1 flex flex-col bg-background overflow-hidden min-h-0">
         {selectedPath === null ? (
           <div className="flex-1 flex items-center justify-center text-sm text-muted-foreground">
             Select a folder from Locations to see its files.
@@ -139,7 +141,15 @@ export default function FileBrowserPage(_props: Props) {
         )}
       </section>
 
-      <GenerationPanel file={submitFile} fullPath={submitFullPath} />
+      {batchSelected.size > 0 ? (
+        <BatchPanel
+          selectedPaths={[...batchSelected]}
+          fileIndex={fileIndex}
+          onCleared={() => setBatchSelected(new Set())}
+        />
+      ) : (
+        <GenerationPanel file={submitFile} fullPath={submitFullPath} />
+      )}
 
       <SubmitSheet
         open={sheetOpen}
@@ -149,11 +159,14 @@ export default function FileBrowserPage(_props: Props) {
       />
 
       {batchSelected.size > 0 && (
-        <BatchActionBar
-          selectedPaths={[...batchSelected]}
-          fileIndex={fileIndex}
-          onCleared={() => setBatchSelected(new Set())}
-        />
+        <>
+          <BatchSelectionStrip count={batchSelected.size} onClear={() => setBatchSelected(new Set())} />
+          <BatchActionBar
+            selectedPaths={[...batchSelected]}
+            fileIndex={fileIndex}
+            onCleared={() => setBatchSelected(new Set())}
+          />
+        </>
       )}
     </div>
   )

@@ -136,3 +136,44 @@ async def test_create_cron_trigger_injects_derived_cron():
     with patch.object(trigger_service, "_publish_update", new=AsyncMock()):
         t = await trigger_service.create_trigger(session, payload, profile_names={"P1"})
     assert t.config["cron"] == "0 3 * * *"
+
+
+# ---------------------------------------------------------------------------
+# WS5 (2026-07 audit): cron config validation at save time
+# ---------------------------------------------------------------------------
+
+def _mk_cron_trigger():
+    return Trigger(
+        id="t-cron", name="Nightly", type="cron",
+        config={"schedule": {"mode": "daily", "time": "03:00"},
+                "cron": "0 3 * * *", "scan_path": "/media"},
+        action={"profile_name": "P1"}, file_filter=None, enabled=True,
+        webhook_secret=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_cron_config_without_schedule_preserves_cron():
+    """A config update that omits 'schedule' must not silently store a config
+    with no 'cron' key — that KeyError'd every evaluation, forever."""
+    t = _mk_cron_trigger()
+    session = AsyncMock(); session.commit = AsyncMock(); session.refresh = AsyncMock()
+    from app.models.schemas import TriggerUpdate
+    payload = TriggerUpdate(config={"scan_path": "/media/movies"})
+    with patch("app.services.trigger_service.get_trigger", AsyncMock(return_value=t)), \
+         patch("app.services.trigger_service._publish_update", AsyncMock()):
+        out = await trigger_service.update_trigger(session, "t-cron", payload, {"P1"})
+    assert out.config["cron"] == "0 3 * * *"
+    assert out.config["scan_path"] == "/media/movies"
+
+
+@pytest.mark.asyncio
+async def test_update_cron_config_missing_scan_path_rejected():
+    t = _mk_cron_trigger()
+    session = AsyncMock(); session.commit = AsyncMock(); session.refresh = AsyncMock()
+    from app.models.schemas import TriggerUpdate
+    payload = TriggerUpdate(config={"schedule": {"mode": "daily", "time": "04:00"}})
+    with patch("app.services.trigger_service.get_trigger", AsyncMock(return_value=t)), \
+         patch("app.services.trigger_service._publish_update", AsyncMock()):
+        with pytest.raises(ValueError, match="scan_path"):
+            await trigger_service.update_trigger(session, "t-cron", payload, {"P1"})

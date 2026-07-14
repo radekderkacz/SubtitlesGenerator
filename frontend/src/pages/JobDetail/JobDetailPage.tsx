@@ -1,6 +1,6 @@
 import { Link, useParams } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowLeft, FileQuestion, RefreshCw } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, CheckCircle2, FileQuestion, RefreshCw, XCircle } from 'lucide-react'
 import PhaseBadge from '@/components/Queue/PhaseBadge'
 import PhaseTimeline from '@/components/Queue/PhaseTimeline'
 import CompletionCard from '@/components/Queue/CompletionCard'
@@ -10,6 +10,7 @@ import VerificationBadge from '@/components/Queue/VerificationBadge'
 import { ApiRequestError, getJob, getJobLog, reverifyJob } from '@/lib/api'
 import { useJobStore } from '@/store/jobStore'
 import { withApiToast } from '@/lib/apiToast'
+import { verdictHeadline, issueCopy, formatClock, type IssueCopy } from '@/lib/verificationCopy'
 import { basename, formatDuration } from '@/lib/utils'
 import type { Job } from '@/types/api'
 
@@ -58,67 +59,179 @@ function CheckRow({ name, severity, detail }: CheckRowProps) {
   )
 }
 
+type IssueBlockProps = Readonly<{
+  severity: string
+  copy: IssueCopy
+  repeated?: { text: string; start: number; end: number; count: number }
+}>
+
+function IssueBlock({ severity, copy, repeated }: IssueBlockProps) {
+  const Icon = severity === 'fail' ? XCircle : AlertTriangle
+  const color = severity === 'fail' ? 'text-destructive' : 'text-amber-500'
+  return (
+    <div className="flex items-start gap-2.5">
+      <Icon className={`h-4 w-4 shrink-0 mt-0.5 ${color}`} aria-hidden="true" />
+      <div className="space-y-0.5">
+        <p className="text-sm font-semibold text-foreground">{copy.title}</p>
+        <p className="text-xs text-muted-foreground">{copy.explanation}</p>
+        {copy.suggestion && (
+          <p className="text-xs text-muted-foreground/90">→ {copy.suggestion}</p>
+        )}
+        {repeated && (
+          <details className="text-xs text-muted-foreground/90 mt-0.5">
+            <summary className="cursor-pointer hover:text-foreground select-none">Show the repeated line</summary>
+            <p className="mt-1">
+              <span className="font-mono">{repeated.text}</span>{' '}· repeated {repeated.count}× · {formatClock(repeated.start)}–{formatClock(repeated.end)}
+            </p>
+          </details>
+        )}
+      </div>
+    </div>
+  )
+}
+
+type MetricTile = Readonly<{ label: string; value: string; unit?: string; alert?: boolean }>
+
+function metricTiles(m: NonNullable<NonNullable<Job['verification_report']>['metrics']>): MetricTile[] {
+  const tiles: MetricTile[] = [
+    { label: 'Reading speed p95', value: `${m.cps_p95}`, unit: 'cps', alert: m.cps_p95 > 20 },
+    { label: 'Fast cues >20cps', value: `${m.pct_cues_over_20cps}`, unit: '%', alert: m.pct_cues_over_20cps > 5 },
+    { label: 'Cues', value: m.cue_count.toLocaleString() },
+    { label: 'Shortest cue', value: m.min_duration.toFixed(2), unit: 's', alert: m.min_duration < 0.5 },
+  ]
+  if (m.coverage_ratio !== null && m.coverage_ratio !== undefined) {
+    tiles.splice(2, 0, {
+      label: 'Coverage',
+      value: `${Math.round(m.coverage_ratio * 100)}`,
+      unit: '%',
+      alert: m.coverage_ratio < 0.5 || m.coverage_ratio > 1.1,
+    })
+  }
+  if (m.gaps_over_90s > 0) {
+    tiles.push({ label: 'Long silences', value: `${m.gaps_over_90s}`, unit: `max ${Math.round(m.max_gap)}s` })
+  }
+  return tiles
+}
+
+type ScorecardProps = Readonly<{ metrics: NonNullable<NonNullable<Job['verification_report']>['metrics']> }>
+
+// Tile idiom: lowered tile surface inside the card, bold widest-tracked
+// micro-label, large mono value with the unit as a small muted suffix.
+function QualityScorecard({ metrics }: ScorecardProps) {
+  const tiles = metricTiles(metrics)
+  if (tiles.length === 0) return null
+  return (
+    <div data-testid="quality-scorecard" className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-4">
+      {tiles.map((t) => (
+        <div key={t.label} className="bg-background/60 border border-border/50 rounded-lg p-3">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground truncate mb-1" title={t.label}>
+            {t.label}
+          </p>
+          <p className={`text-lg leading-tight font-mono tabular-nums ${t.alert ? 'text-amber-400' : 'text-foreground'}`}>
+            {t.value}
+            {t.unit && <span className="text-xs font-normal text-muted-foreground"> {t.unit}</span>}
+          </p>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 type VerificationPanelProps = Readonly<{ job: Job }>
 
 function VerificationPanel({ job }: VerificationPanelProps) {
   if (!job.verification_status) return null
+  const status = job.verification_status
+  const checks = job.verification_report?.checks ?? []
 
-  const report = job.verification_report
-  const checks = report?.checks ?? []
+  const ranked = checks
+    .filter((c) => c.severity === 'fail' || c.severity === 'warn')
+    .sort((a, b) => (a.severity === 'fail' ? 0 : 1) - (b.severity === 'fail' ? 0 : 1))
+  const seen = new Set<string>()
+  const issues: Array<{ severity: string; copy: IssueCopy; repeated?: { text: string; start: number; end: number; count: number } }> = []
+  for (const c of ranked) {
+    const copy = issueCopy(c)
+    if (copy && !seen.has(copy.title)) {
+      seen.add(copy.title)
+      issues.push({ severity: c.severity, copy, repeated: c.repeated })
+    }
+  }
+
+  const okCount = checks.filter((c) => c.severity === 'ok').length
+  const headline = verdictHeadline(status, issues.length)
 
   const layers = ['structural', 'heuristic', 'semantic'] as const
-  const grouped = layers.map((layer) => ({
-    layer,
-    items: checks.filter((c) => c.layer === layer),
-  })).filter((g) => g.items.length > 0)
+  const grouped = layers
+    .map((layer) => ({ layer, items: checks.filter((c) => c.layer === layer) }))
+    .filter((g) => g.items.length > 0)
 
   const handleReverify = () => {
     void withApiToast(() => reverifyJob(job.id), { successMessage: 'Re-verification started' })
   }
 
   return (
-    <section
-      aria-labelledby="verification-heading"
-      className="bg-card border border-border rounded-lg p-6"
-    >
-      <div className="flex items-center justify-between mb-4">
-        <h2
-          id="verification-heading"
-          className="text-sm font-semibold text-muted-foreground uppercase tracking-wider"
-        >
+    <section aria-labelledby="verification-heading" className="bg-card border border-border rounded-lg p-6">
+      <div className="flex items-center justify-between mb-3">
+        <h2 id="verification-heading" className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
           Verification
         </h2>
-        <VerificationBadge status={job.verification_status} score={job.verification_score} />
+        <VerificationBadge status={status} />
       </div>
-      {report?.summary && (
-        <p className="text-xs text-muted-foreground mb-4">{report.summary}</p>
+
+      {headline.summary && (
+        <p className="text-sm text-foreground/80 mb-4">{headline.summary}</p>
       )}
-      {grouped.length > 0 && (
-        <div className="space-y-3">
-          {grouped.map(({ layer, items }) => (
-            <div key={layer}>
-              <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground mb-1">
-                {layer}
-              </p>
-              <ul className="space-y-1">
-                {items.map((c, i) => (
-                  <CheckRow key={`${c.name}-${i}`} layer={c.layer} name={c.name} severity={c.severity} detail={c.detail} />
-                ))}
-              </ul>
-            </div>
+
+      {issues.length > 0 && (
+        <div className="space-y-3 mb-4">
+          {issues.map((it) => (
+            <IssueBlock key={it.copy.title} severity={it.severity} copy={it.copy} repeated={it.repeated} />
           ))}
         </div>
       )}
-      <div className="mt-4">
-        <button
-          type="button"
-          onClick={handleReverify}
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-secondary text-secondary-foreground text-xs font-medium hover:opacity-90 transition-opacity"
-        >
-          <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
-          Re-verify
-        </button>
-      </div>
+
+      {job.verification_report?.metrics && (
+        <QualityScorecard metrics={job.verification_report.metrics} />
+      )}
+
+      {okCount > 0 && (
+        <p className="flex items-center gap-1.5 text-xs text-muted-foreground mb-4">
+          <CheckCircle2 className="h-3.5 w-3.5 text-green-500" aria-hidden="true" />
+          {okCount} other check{okCount === 1 ? '' : 's'} passed.
+        </p>
+      )}
+
+      {checks.length > 0 && (
+        <details className="mb-4">
+          <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground select-none">
+            See all details
+          </summary>
+          <div className="mt-3 space-y-3">
+            {grouped.map(({ layer, items }) => (
+              <div key={layer}>
+                <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground mb-1">{layer}</p>
+                <ul className="space-y-1">
+                  {items.map((c, i) => (
+                    <CheckRow key={`${c.name}-${i}`} layer={c.layer} name={c.name} severity={c.severity} detail={c.detail} />
+                  ))}
+                </ul>
+              </div>
+            ))}
+            {typeof job.verification_score === 'number' && (
+              <p className="text-[11px] text-muted-foreground/70">Score: {Math.round(job.verification_score)}/100</p>
+            )}
+          </div>
+        </details>
+      )}
+
+      <button
+        type="button"
+        onClick={handleReverify}
+        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-secondary text-secondary-foreground text-xs font-medium hover:opacity-90 transition-opacity"
+      >
+        <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+        Re-verify
+      </button>
     </section>
   )
 }

@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from collections import deque
 from datetime import datetime, timezone
 from typing import Callable, Iterable, Optional
@@ -217,8 +218,45 @@ def _make_handler(trigger_id: str, loop: asyncio.AbstractEventLoop):
     return _Handler()
 
 
+# A created event fires the moment the copy STARTS; transcribing a half-copied
+# file "completes" with subtitles for a fraction of the movie. Wait for the
+# size to hold still across a probe interval before dispatching.
+_SETTLE_PROBE_SECONDS = 10.0
+_SETTLE_MAX_WAIT_SECONDS = 1800.0
+
+
+async def _wait_for_stable_size(
+    path: str,
+    *,
+    probe_seconds: float = _SETTLE_PROBE_SECONDS,
+    max_wait_seconds: float = _SETTLE_MAX_WAIT_SECONDS,
+) -> bool:
+    """True once the file's size holds still across one probe interval; False
+    when it vanishes or is still growing after ``max_wait_seconds``."""
+    deadline = time.monotonic() + max_wait_seconds
+    last_size = -1
+    while time.monotonic() < deadline:
+        try:
+            size = await asyncio.to_thread(os.path.getsize, path)
+        except OSError:
+            return False  # vanished / unreadable mid-copy
+        if size == last_size and size > 0:
+            return True
+        last_size = size
+        await asyncio.sleep(probe_seconds)
+    return False
+
+
 async def _fire(trigger_id: str, path: str, event_type: str) -> None:
     from app.services.trigger_executor import MatchEvent, dispatch_event
+
+    if not await _wait_for_stable_size(path):
+        logger.warning(
+            "Watch trigger %s: %s never size-settled (still copying or gone) — "
+            "not dispatching; a scheduled scan will pick it up once complete",
+            trigger_id, path,
+        )
+        return
 
     async with AsyncSessionLocal() as session:
         await dispatch_event(

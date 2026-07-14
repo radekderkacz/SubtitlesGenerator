@@ -48,6 +48,20 @@ def _validate_action_profile(action, profile_names: set[str]) -> None:
         raise ProfileNotFoundError(action.profile_name)
 
 
+def _validated_cron_config(cfg: dict) -> dict:
+    """A cron trigger config must carry a parseable derived cron expression
+    and a scan_path — a config that loses either KeyErrors every Beat
+    evaluation forever (2026-07 audit R9)."""
+    from croniter import croniter
+
+    if not cfg.get("cron"):
+        raise ValueError("cron trigger config requires a schedule")
+    croniter(cfg["cron"])  # raises ValueError on a malformed expression
+    if not cfg.get("scan_path"):
+        raise ValueError("cron trigger config requires scan_path")
+    return cfg
+
+
 async def create_trigger(
     session: AsyncSession, payload: TriggerCreate, profile_names: set[str]
 ) -> Trigger:
@@ -57,7 +71,7 @@ async def create_trigger(
     if payload.type.value == "cron":
         cfg = dict(payload.config)
         cfg["cron"] = schedule_to_cron(cfg["schedule"])
-        config_to_store = cfg
+        config_to_store = _validated_cron_config(cfg)
 
     t = Trigger(
         id=str(uuid.uuid4()),
@@ -142,7 +156,11 @@ async def update_trigger(
             cfg = dict(payload.config)
             if "schedule" in cfg:
                 cfg["cron"] = schedule_to_cron(cfg["schedule"])
-            config_to_store = cfg
+            elif "cron" not in cfg and isinstance(t.config, dict) and "cron" in t.config:
+                # An update that omits the schedule keeps the derived cron —
+                # storing a config without it bricked the trigger silently.
+                cfg["cron"] = t.config["cron"]
+            config_to_store = _validated_cron_config(cfg)
         t.config = config_to_store
     if payload.enabled is not None:
         t.enabled = payload.enabled

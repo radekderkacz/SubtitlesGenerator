@@ -309,3 +309,45 @@ async def test_watcher_reads_from_triggers_table(monkeypatch, tmp_path):
     w = Watcher()
     await w.start()
     assert started == [str(tmp_path)]
+
+
+# ---------------------------------------------------------------------------
+# WS5 (2026-07 audit): file-size settle gate for watch triggers
+# ---------------------------------------------------------------------------
+import asyncio
+
+from app.services.watcher import _wait_for_stable_size
+
+
+def test_stable_file_passes_quickly(tmp_path):
+    f = tmp_path / "movie.mkv"
+    f.write_bytes(b"x" * 1024)
+    ok = asyncio.run(_wait_for_stable_size(str(f), probe_seconds=0.01, max_wait_seconds=1.0))
+    assert ok is True
+
+
+def test_growing_file_waits_then_gives_up(tmp_path):
+    f = tmp_path / "movie.mkv"
+    f.write_bytes(b"x")
+    grow = {"n": 0}
+    import app.services.watcher as w
+    real_getsize = w.os.path.getsize
+
+    def fake_getsize(path):
+        grow["n"] += 1
+        return grow["n"]  # size changes on every probe — never settles
+
+    w_os_patch = fake_getsize
+    orig = w.os.path.getsize
+    w.os.path.getsize = w_os_patch
+    try:
+        ok = asyncio.run(_wait_for_stable_size(str(f), probe_seconds=0.01, max_wait_seconds=0.1))
+    finally:
+        w.os.path.getsize = orig
+    assert ok is False
+
+
+def test_vanished_file_returns_false(tmp_path):
+    ok = asyncio.run(_wait_for_stable_size(str(tmp_path / "gone.mkv"),
+                                           probe_seconds=0.01, max_wait_seconds=0.5))
+    assert ok is False

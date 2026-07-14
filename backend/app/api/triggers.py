@@ -89,6 +89,10 @@ async def create_trigger(payload: TriggerCreate, session: DbSession):
         return JSONResponse(
             status_code=422, content={"detail": str(e), "code": "PROFILE_NOT_FOUND"}
         )
+    except (ValueError, KeyError) as e:
+        return JSONResponse(
+            status_code=422, content={"detail": str(e), "code": "INVALID_CONFIG"}
+        )
     return await _to_response(session, t)
 
 
@@ -131,6 +135,10 @@ async def update_trigger(trigger_id: str, payload: TriggerUpdate, session: DbSes
     except trigger_service.ProfileNotFoundError as e:
         return JSONResponse(
             status_code=422, content={"detail": str(e), "code": "PROFILE_NOT_FOUND"}
+        )
+    except (ValueError, KeyError) as e:
+        return JSONResponse(
+            status_code=422, content={"detail": str(e), "code": "INVALID_CONFIG"}
         )
     if t is None:
         return JSONResponse(status_code=404, content=_TRIGGER_NOT_FOUND)

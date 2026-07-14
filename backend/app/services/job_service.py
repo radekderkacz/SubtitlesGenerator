@@ -1,6 +1,7 @@
 import uuid
 
 from sqlalchemy import delete, desc, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.orm import Job, Settings, _utcnow
@@ -17,6 +18,30 @@ _TERMINAL_STATUSES: tuple[JobStatus, ...] = (
 class ProfileNotFoundError(Exception):
     """Raised by enqueue_job when JobCreate.profile_name is not in
     Settings.profiles. The API layer maps this to a 422."""
+
+
+class DuplicateJobError(Exception):
+    """An active (queued/processing) job already exists for this file. Raised
+    on the pre-check or when the uq_jobs_active_file partial unique index
+    rejects the insert (the backstop for check-then-act races). The API layer
+    maps this to a 409."""
+
+    def __init__(self, file_path: str) -> None:
+        super().__init__(f"An active job already exists for {file_path}")
+        self.file_path = file_path
+
+
+async def _commit_new_job(session: AsyncSession, job: Job) -> Job:
+    """Commit a new Job row, translating a unique-index rejection into
+    DuplicateJobError (with rollback so the session stays usable)."""
+    session.add(job)
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise DuplicateJobError(job.file_path) from exc
+    await session.refresh(job)
+    return job
 
 
 async def enqueue_job(
@@ -50,6 +75,9 @@ async def enqueue_job(
     snapshot = {k: profile.get(k) for k in backend_keys}
     snapshot["name"] = profile.get("name")
 
+    if await _has_active_job_for_path(session, payload.file_path):
+        raise DuplicateJobError(payload.file_path)
+
     job = Job(
         id=str(uuid.uuid4()),
         file_path=payload.file_path,
@@ -61,9 +89,7 @@ async def enqueue_job(
         created_at=now,
         updated_at=now,
     )
-    session.add(job)
-    await session.commit()
-    await session.refresh(job)
+    job = await _commit_new_job(session, job)
 
     if dispatch:
         # Deferred import: worker.tasks pulls in Celery + ffmpeg + whisperx and
@@ -119,8 +145,29 @@ class RetryError(Exception):
 # ``processing`` is treated as an orphan — most likely the API created the
 # DB row but the corresponding Celery dispatch was lost (incident
 # 2026-05-15). Below the threshold the row is just waiting for the worker
-# to pick it up; a retry would just create a duplicate.
-STUCK_QUEUED_THRESHOLD_SECONDS = 30
+# to pick it up (or sitting out a scheduled auto-retry backoff — up to
+# 900s, tasks._JOB_RETRY_BACKOFF); inviting a manual retry inside that
+# window double-ran jobs (2026-07 audit R6).
+STUCK_QUEUED_THRESHOLD_SECONDS = 1200
+
+
+async def _clone_and_queue(session: AsyncSession, original: Job) -> Job:
+    """Create a fresh queued Job copying the original's file + settings snapshot.
+    ``backend_profile`` is the single source of truth for the worker, so the new
+    run is identical to the original's configuration."""
+    now = _utcnow()
+    new_job = Job(
+        id=str(uuid.uuid4()),
+        file_path=original.file_path,
+        source_language=original.source_language,
+        target_language=original.target_language,
+        backend_profile=original.backend_profile,
+        source="manual",
+        status=JobStatus.queued,
+        created_at=now,
+        updated_at=now,
+    )
+    return await _commit_new_job(session, new_job)
 
 
 async def retry_failed_job(
@@ -162,22 +209,40 @@ async def retry_failed_job(
             f"Only failed jobs can be retried (got status={original.status})",
         )
 
-    now = _utcnow()
-    new_job = Job(
-        id=str(uuid.uuid4()),
-        file_path=original.file_path,
-        source_language=original.source_language,
-        target_language=original.target_language,
-        backend_profile=original.backend_profile,
-        source="manual",
-        status=JobStatus.queued,
-        created_at=now,
-        updated_at=now,
+    return await _clone_and_queue(session, original)
+
+
+async def _has_active_job_for_path(session: AsyncSession, file_path: str) -> bool:
+    result = await session.execute(
+        select(Job.id)
+        .where(Job.file_path == file_path, Job.status.in_(_ACTIVE_STATUSES))
+        .limit(1)
     )
-    session.add(new_job)
-    await session.commit()
-    await session.refresh(new_job)
-    return new_job
+    return result.first() is not None
+
+
+class RegenerateError(Exception):
+    """Raised by ``regenerate_job``. The API maps the code to 404 / 400 / 409."""
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+async def regenerate_job(session: AsyncSession, original_id: str) -> Job:
+    """Re-queue a terminal job's file using its original settings snapshot.
+    Refuses non-terminal source jobs and duplicates (an active job already exists
+    for the same file)."""
+    original = await session.get(Job, original_id)
+    if original is None:
+        raise RegenerateError("JOB_NOT_FOUND", "Job not found")
+    if original.status not in _TERMINAL_STATUSES:
+        raise RegenerateError(
+            "JOB_NOT_TERMINAL",
+            f"Only finished jobs can be regenerated (got status={original.status})",
+        )
+    if await _has_active_job_for_path(session, original.file_path):
+        raise RegenerateError("ALREADY_ACTIVE", "A job for this file is already in the queue")
+    return await _clone_and_queue(session, original)
 
 
 async def list_history(

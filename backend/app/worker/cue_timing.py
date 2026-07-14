@@ -14,22 +14,26 @@ See ``docs/superpowers/specs/2026-06-17-subtitle-timing-design.md``.
 """
 from __future__ import annotations
 
-import re
-
 MAX_CHARS_PER_LINE = 42
 MAX_LINES = 2
 MAX_CUE_CHARS = MAX_CHARS_PER_LINE * MAX_LINES  # 84
 MAX_CUE_DURATION = 7.0
 MIN_CUE_DURATION = 1.0
+MIN_READABLE_DURATION = 0.833  # Netflix minimum display time
+MERGE_GAP_MAX = 0.5            # only merge across sub-half-second silences
 MIN_GAP = 0.08
 READING_SPEED_CPS = 17.0
 PAUSE_SPLIT_SECONDS = 1.0
 _SENTENCE_END = (".", "!", "?", "…")
 _CLAUSE_BREAK = (",", ";", ":")
-# A sentence = a run of non-terminator chars followed by any trailing
-# terminators. Requires at least one non-terminator, so a pure-punctuation
-# fragment (e.g. "...") yields no sentence.
-_SENTENCE_RE = re.compile(r"[^.!?…]+[.!?…]*")
+_CJK_TERMINATORS = "。！？"
+_TRAILING_CLOSERS = ".!?…\"'”’)"
+# Dots after these words are abbreviations, not sentence ends. Single-letter
+# words ("U.S.A.", "p.m.") are handled separately in _is_sentence_end.
+_ABBREVIATIONS = frozenset({
+    "dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st", "vs", "etc",
+    "gen", "col", "sgt", "lt", "capt", "no", "vol", "approx",
+})
 
 # Both Word and Cue are normalized dicts with three keys: a stripped "text"
 # string plus float "start" and "end" times in seconds.
@@ -59,7 +63,9 @@ def extract_words(response: dict) -> list[dict]:
         start, end = w.get("start"), w.get("end")
         if not text or start is None or end is None:
             continue
-        out.append({"text": text, "start": float(start), "end": float(end)})
+        s, e = float(start), float(end)
+        out.append({"text": text, "start": min(s, e), "end": max(s, e)})
+    out.sort(key=lambda w: (w["start"], w["end"]))
     return out
 
 
@@ -135,10 +141,79 @@ def enforce_timing(
         end = min(end, c["start"] + max_duration)
         end = max(end, c["start"] + min_duration)
         if i + 1 < len(out):
-            ceiling = out[i + 1]["start"] - min_gap
-            if ceiling > c["start"]:
-                end = min(end, ceiling)
+            # The gap to the next cue always wins — a too-short cue is the
+            # merge step's problem; an overlapping one corrupts playback.
+            end = min(end, out[i + 1]["start"] - min_gap)
         c["end"] = end
+    return out
+
+
+def apply_invariants(
+    cues: list[dict],
+    *,
+    min_gap: float = MIN_GAP,
+    min_duration: float = MIN_CUE_DURATION,
+) -> list[dict]:
+    """Final safety net before cues leave this module: sorted by start, strictly
+    positive durations, and at least ``min_gap`` between consecutive cues.
+    Overlaps are resolved by trimming the earlier cue; when the earlier cue has
+    no room to trim, the two cues merge (text is never dropped)."""
+    ordered = sorted(
+        (dict(c) for c in cues if c["text"].strip()),
+        key=lambda c: (c["start"], c["end"]),
+    )
+    out: list[dict] = []
+    for c in ordered:
+        if c["end"] <= c["start"]:
+            c["end"] = c["start"] + min_duration
+        if out:
+            prev = out[-1]
+            if c["start"] < prev["end"] + min_gap:
+                trimmed = c["start"] - min_gap
+                if trimmed > prev["start"]:
+                    prev["end"] = trimmed
+                else:
+                    prev["text"] = f'{prev["text"]} {c["text"]}'.strip()
+                    prev["end"] = max(prev["end"], c["end"])
+                    continue
+        out.append(c)
+    return out
+
+
+def _display_window(cues: list[dict], i: int, min_gap: float) -> float:
+    """Display time cue i can possibly get, capped by the next cue's start."""
+    c = cues[i]
+    hard_end = c["end"]
+    if i + 1 < len(cues):
+        hard_end = min(hard_end, cues[i + 1]["start"] - min_gap)
+    return hard_end - c["start"]
+
+
+def merge_short_cues(
+    cues: list[dict],
+    *,
+    min_duration: float = MIN_READABLE_DURATION,
+    max_chars: int = MAX_CUE_CHARS,
+    merge_gap: float = MERGE_GAP_MAX,
+    min_gap: float = MIN_GAP,
+) -> list[dict]:
+    """Merge cues that cannot reach a readable display duration into the next
+    cue, provided the silence between them is short and the combined text still
+    fits one cue. Runs before ``enforce_timing`` so a trailing short cue with
+    silence after it is left for the linger rule instead of merging."""
+    out = [dict(c) for c in cues]
+    i = 0
+    while i < len(out):
+        if _display_window(out, i, min_gap) >= min_duration or i + 1 >= len(out):
+            i += 1
+            continue
+        nxt = out[i + 1]
+        combined = f'{out[i]["text"]} {nxt["text"]}'.strip()
+        if nxt["start"] - out[i]["end"] <= merge_gap and len(combined) <= max_chars:
+            out[i] = {"text": combined, "start": out[i]["start"], "end": nxt["end"]}
+            del out[i + 1]
+            continue  # re-evaluate the merged cue
+        i += 1
     return out
 
 
@@ -158,15 +233,24 @@ def _balanced_two_line_split(words: list[str], max_chars: int) -> str | None:
     return " ".join(words[:best_split]) + "\n" + " ".join(words[best_split:])
 
 
+def _hard_chunks(token: str, max_chars: int) -> list[str]:
+    """Slice a token with no usable word boundaries (CJK, URLs) into
+    line-sized pieces."""
+    return [token[i:i + max_chars] for i in range(0, len(token), max_chars)]
+
+
 def _greedy_fill(words: list[str], max_chars: int) -> str:
-    """Word-boundary greedy fill — the fallback when balanced wrapping can't fit."""
+    """Word-boundary greedy fill — the fallback when balanced wrapping can't
+    fit. Tokens longer than a line are hard-broken so no output line ever
+    exceeds ``max_chars``."""
     lines, cur = [], ""
     for w in words:
-        if cur and len(cur) + 1 + len(w) > max_chars:
-            lines.append(cur)
-            cur = w
-        else:
-            cur = f"{cur} {w}".strip()
+        for piece in (_hard_chunks(w, max_chars) if len(w) > max_chars else [w]):
+            if cur and len(cur) + 1 + len(piece) > max_chars:
+                lines.append(cur)
+                cur = piece
+            else:
+                cur = f"{cur} {piece}".strip()
     if cur:
         lines.append(cur)
     return "\n".join(lines)
@@ -191,16 +275,33 @@ def _too_big(words: list[dict], max_chars: int, max_duration: float) -> bool:
 
 
 def _best_break(words: list[dict]) -> int:
-    """Index to split AFTER. Prefer a clause break nearest the middle; else the
-    largest inter-word pause; else the middle."""
-    mid = len(words) / 2
-    clause = [i for i, w in enumerate(words[:-1]) if w["text"].endswith(_CLAUSE_BREAK)]
+    """Index to split AFTER. Prefer a clause break nearest the middle, then a
+    dominant pause, then the chars-balanced word boundary — never a split that
+    would orphan a fragment shorter than 10 chars on either side."""
+    total = len(" ".join(w["text"] for w in words))
+
+    def left_len(i: int) -> int:
+        return len(" ".join(w["text"] for w in words[: i + 1]))
+
+    def side_ok(i: int) -> bool:
+        return 10 <= left_len(i) <= total - 10
+
+    def char_dist(i: int) -> float:
+        return abs(left_len(i) - total / 2)
+
+    ok = [i for i in range(len(words) - 1) if side_ok(i)]
+    if not ok:
+        ok = list(range(len(words) - 1)) or [0]
+    clause = [i for i in ok if words[i]["text"].endswith(_CLAUSE_BREAK)]
     if clause:
-        return min(clause, key=lambda i: abs(i - mid))
-    if len(words) > 2:
-        gaps = [(words[i + 1]["start"] - words[i]["end"], i) for i in range(len(words) - 1)]
-        return max(gaps)[1]
-    return len(words) // 2 - 1 if len(words) > 1 else 0
+        return min(clause, key=char_dist)
+    gaps = sorted(words[i + 1]["start"] - words[i]["end"] for i in range(len(words) - 1))
+    median_gap = gaps[len(gaps) // 2] if gaps else 0.0
+    pause, pause_i = max(((words[i + 1]["start"] - words[i]["end"], i) for i in ok),
+                         default=(0.0, ok[0]))
+    if pause > max(3 * median_gap, 0.3):
+        return pause_i
+    return min(ok, key=char_dist)
 
 
 def split_long_sentence(
@@ -226,24 +327,163 @@ def split_long_sentence(
             + split_long_sentence(right, max_chars=max_chars, max_duration=max_duration))
 
 
+def _split_point_text(words: list[str]) -> int:
+    """Word index to split AFTER: clause break nearest the middle when both
+    sides keep >= 10 chars, else the chars-balanced word boundary."""
+    total = len(" ".join(words))
+
+    def left_len(i: int) -> int:
+        return len(" ".join(words[: i + 1]))
+
+    def side_ok(i: int) -> bool:
+        return 10 <= left_len(i) <= total - 10
+
+    def char_dist(i: int) -> float:
+        return abs(left_len(i) - total / 2)
+
+    clause = [i for i, w in enumerate(words[:-1]) if w.endswith(_CLAUSE_BREAK) and side_ok(i)]
+    if clause:
+        return min(clause, key=char_dist)
+    candidates = [i for i in range(len(words) - 1) if side_ok(i)] or list(range(len(words) - 1))
+    return min(candidates, key=char_dist)
+
+
+def split_long_cue_text(cue: dict, *, max_chars: int = MAX_CUE_CHARS) -> list[dict]:
+    """Split a cue whose (translated or heuristic) text exceeds ``max_chars``
+    into sub-cues at the clause/word boundary nearest the middle, distributing
+    the time span proportionally to character share. Text-mode counterpart of
+    ``split_long_sentence`` for paths that have no word timestamps."""
+    text = cue["text"]
+    if len(text) <= max_chars:
+        return [cue]
+    words = text.split()
+    if len(words) < 2:  # no word boundaries (CJK / pathological token): hard-slice
+        pieces = [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+    else:
+        b = _split_point_text(words)
+        pieces = [" ".join(words[: b + 1]), " ".join(words[b + 1:])]
+    span = cue["end"] - cue["start"]
+    total = sum(len(p) for p in pieces)
+    out: list[dict] = []
+    cursor = cue["start"]
+    for i, p in enumerate(pieces):
+        is_last = i == len(pieces) - 1
+        p_end = cue["end"] if is_last else cursor + span * (len(p) / total)
+        out.extend(split_long_cue_text({"text": p, "start": cursor, "end": p_end},
+                                       max_chars=max_chars))
+        cursor = p_end
+    return out
+
+
+def _fit_lines(cue: dict) -> list[dict]:
+    """Wrap a cue's text; when the wrap needs more than MAX_LINES lines (text
+    within the char cap can still lack a word boundary for a 2x42 split), split
+    the cue in time at the balanced word boundary and fit each half."""
+    wrapped = wrap_lines(cue["text"])
+    words = cue["text"].split()
+    if wrapped.count("\n") + 1 <= MAX_LINES or len(words) < 2:
+        return [dict(cue, text=wrapped)]
+    b = _split_point_text(words)
+    pieces = [" ".join(words[: b + 1]), " ".join(words[b + 1:])]
+    span = cue["end"] - cue["start"]
+    total = sum(len(p) for p in pieces)
+    mid = cue["start"] + span * (len(pieces[0]) / total)
+    first_end = max(cue["start"] + 1e-3, mid - MIN_GAP)
+    return (_fit_lines({"text": pieces[0], "start": cue["start"], "end": first_end})
+            + _fit_lines({"text": pieces[1], "start": mid, "end": cue["end"]}))
+
+
+def _finalize(cues: list[dict]) -> list[dict]:
+    """Shared tail of every path: merge unreadably-short cues, apply timing,
+    enforce output invariants, wrap lines (splitting cues that cannot wrap
+    within MAX_LINES)."""
+    cues = merge_short_cues(cues)
+    cues = enforce_timing(cues)
+    cues = apply_invariants(cues)
+    out: list[dict] = []
+    for c in cues:
+        out.extend(_fit_lines(c))
+    return out
+
+
 def format_cues(words: list[dict]) -> list[dict]:
     """Words -> final timed, wrapped source cues (no translation).
 
     Sentence-segment, split any over-long sentence on its source words, then
-    apply reading-speed/duration/gap timing and line wrapping."""
+    apply the shared merge/timing/invariant/wrap chain."""
     cues: list[dict] = []
     for group in _group_words_by_cue(words):
         cues.extend(split_long_sentence(group))
-    cues = enforce_timing(cues)
-    for c in cues:
-        c["text"] = wrap_lines(c["text"])
-    return cues
+    return _finalize(cues)
+
+
+def _skip_closers(text: str, i: int) -> int:
+    """First index after the terminator run starting at ``text[i]``."""
+    j = i + 1
+    while j < len(text) and text[j] in _TRAILING_CLOSERS:
+        j += 1
+    return j
+
+
+def _word_before(text: str, i: int) -> str:
+    """The alphabetic word immediately preceding index ``i``."""
+    j = i
+    while j > 0 and text[j - 1].isalpha():
+        j -= 1
+    return text[j:i]
+
+
+def _is_abbreviation_dot(text: str, i: int) -> bool:
+    """A dot after a known abbreviation or single letter ("Dr.", "U.S.A.")."""
+    if text[i] != ".":
+        return False
+    word = _word_before(text, i)
+    return bool(word) and (word.lower() in _ABBREVIATIONS or len(word) == 1)
+
+
+def _is_sentence_end(text: str, i: int) -> bool:
+    """True when the terminator at ``text[i]`` really ends a sentence — i.e. it
+    is followed by whitespace + an uppercase/opening character, and a dot is not
+    part of an abbreviation, initialism, or decimal number."""
+    if text[i] in _CJK_TERMINATORS:
+        return True
+    j = _skip_closers(text, i)
+    if j >= len(text):
+        return True
+    if not text[j].isspace():
+        return False                      # "3.14", "e.g.x" — mid-token dot
+    k = j
+    while k < len(text) and text[k].isspace():
+        k += 1
+    if k >= len(text):
+        return True
+    opens_sentence = text[k].isupper() or text[k].isdigit() or text[k] in "\"'“‘¿¡-–—…♪"
+    return opens_sentence and not _is_abbreviation_dot(text, i)
 
 
 def _split_sentences(text: str) -> list[str]:
-    """Split text into sentences on .!?… , keeping the terminator. Whitespace is
-    trimmed and empty / pure-punctuation fragments are dropped."""
-    return [m.group().strip() for m in _SENTENCE_RE.finditer(text) if m.group().strip()]
+    """Split text into sentences, keeping terminators, without splitting inside
+    abbreviations, initialisms, or decimal numbers. CJK terminators supported.
+    Whitespace is trimmed; fragments with no alphanumeric content are dropped."""
+    sentences: list[str] = []
+    buf_start = 0
+    i = 0
+    while i < len(text):
+        if (text[i] in _SENTENCE_END or text[i] in _CJK_TERMINATORS) and _is_sentence_end(text, i):
+            j = i + 1
+            while j < len(text) and text[j] in _TRAILING_CLOSERS:
+                j += 1
+            candidate = text[buf_start:j].strip()
+            if any(ch.isalnum() for ch in candidate):
+                sentences.append(candidate)
+            buf_start = j
+            i = j
+            continue
+        i += 1
+    tail = text[buf_start:].strip()
+    if tail and any(ch.isalnum() for ch in tail):
+        sentences.append(tail)
+    return sentences
 
 
 def _distribute_segment(start: float, end: float, sentences: list[str]) -> list[dict]:
@@ -254,6 +494,11 @@ def _distribute_segment(start: float, end: float, sentences: list[str]) -> list[
     if total_chars == 0:
         return []
     span = end - start
+    if span <= 0:
+        # Garbage segment timing: synthesize a readable window per sentence and
+        # let apply_invariants reconcile any collision with the next segment.
+        end = start + MIN_CUE_DURATION * len(sentences)
+        span = end - start
     cues: list[dict] = []
     cursor = start
     for i, sentence in enumerate(sentences):
@@ -283,20 +528,24 @@ def segments_to_sentence_cues(segments: list[dict]) -> list[dict]:
 
 def format_cues_from_segments(segments: list[dict]) -> list[dict]:
     """Segment-only path -> final timed, wrapped cues (heuristic counterpart of
-    ``format_cues``). Same reading-speed/duration/gap + line-wrap rules."""
-    cues = enforce_timing(segments_to_sentence_cues(segments))
-    for c in cues:
-        c["text"] = wrap_lines(c["text"])
-    return cues
+    ``format_cues``). Over-long sentence cues are split on text before the
+    shared merge/timing/invariant/wrap chain runs."""
+    cues: list[dict] = []
+    for c in segments_to_sentence_cues(segments):
+        cues.extend(split_long_cue_text(c))
+    return _finalize(cues)
 
 
 def reflow_translated(cues: list[dict]) -> list[dict]:
-    """Re-time and re-wrap cues whose text was replaced by a translation.
+    """Re-time, re-split, and re-wrap cues whose text was replaced by a
+    translation.
 
-    Timing is already source-derived; translated text differs in length, so
-    reading-speed and line wrapping are re-applied. Any line breaks carried over
-    from the source wrapping are flattened first so the target wraps cleanly."""
-    cues = enforce_timing(cues)
-    for c in cues:
-        c["text"] = wrap_lines(" ".join(c["text"].splitlines()))
-    return cues
+    Timing is already source-derived, but translations routinely expand 20-30%,
+    so text that no longer fits one cue is split (proportional timing) before
+    the shared merge/timing/invariant/wrap chain re-applies reading-speed and
+    line wrapping. Source line breaks are flattened first."""
+    flat = [dict(c, text=" ".join(c["text"].splitlines())) for c in cues]
+    out: list[dict] = []
+    for c in flat:
+        out.extend(split_long_cue_text(c))
+    return _finalize(out)

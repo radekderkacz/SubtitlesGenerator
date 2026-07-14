@@ -4,3 +4,15 @@ ffmpeg-python==0.2.0
 # directly and never imported litellm; local-WhisperX support was deleted
 # as part of the "remote backends only" refactor. See backend/Dockerfile.worker
 # for the size win.
+# Silero VAD (2026-07 audit WS6): client-side speech-region detection used to
+# reject Whisper hallucinations over silence/music. pysilero-vad ships the
+# ONNX model inside the wheel — no network fetch at runtime.
+# 2.1.0 is the newest release with a py3-none-any wheel; 3.x publishes only
+# an sdist whose scikit-build-core/cmake build breaks on python:3.12-slim.
+pysilero-vad==2.1.0
+onnxruntime==1.27.0
+numpy==2.3.5
+# Output language-ID gate (2026-07 audit WS10): catches untranslated batches
+# and wrong-language output. low_memory mode uses the small model bundled in
+# the wheel — no runtime download.
+fast-langdetect==1.0.1

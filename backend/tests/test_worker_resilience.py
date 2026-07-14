@@ -88,12 +88,14 @@ def test_translation_exhausted_transient_raises_TPE(monkeypatch):
         tasks._post_translation_with_retries("http://t", {}, {"x": 1})
     assert ei.value.step == "translation"
 
-def test_translation_exhausted_terminal_raises_runtime(monkeypatch):
+def test_translation_terminal_error_fails_fast(monkeypatch):
+    """WS3: terminal errors (bad JSON, 4xx) are raised on the FIRST attempt —
+    no pointless 3x hammer before surfacing (was: RuntimeError after 3)."""
     client = MagicMock(); client.post.side_effect = ValueError("bad json")
     monkeypatch.setattr(tasks.httpx, "Client", lambda **k: _ctx(client))
-    with pytest.raises(RuntimeError) as ei:
+    with pytest.raises(ValueError):
         tasks._post_translation_with_retries("http://t", {}, {"x": 1})
-    assert "Translation request failed after 3 attempts" in str(ei.value)
+    assert client.post.call_count == 1
 
 
 import asyncio
@@ -296,11 +298,12 @@ def test_translate_one_segment_propagates_TPE_not_rewrapped(monkeypatch):
     async def run():
         loop = asyncio.get_running_loop()
         from app.worker.usage import UsageAccumulator
-        await tasks._translate_one_segment(
-            loop, {"text": "hello"},
+        tgt = tasks._TranslateTarget(
             provider="ollama", model="gemma3:27b", mapped_model="gemma3:27b",
             base_url="http://x", api_key=None, target_language="pl",
-            context_pairs=None, glossary=None, acc=UsageAccumulator(),
+        )
+        await tasks._translate_one_segment(
+            loop, {"text": "hello"}, tgt, context_pairs=None, acc=UsageAccumulator(),
         )
 
     with pytest.raises(TransientPipelineError) as ei:

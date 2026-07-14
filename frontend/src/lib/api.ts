@@ -266,6 +266,11 @@ export async function reverifyJob(id: string): Promise<void> {
   await apiFetch(`/api/v1/jobs/${encodeURIComponent(id)}/verify`, { method: 'POST' })
 }
 
+/** POST /api/v1/jobs/:id/regenerate — re-queue a finished job's file with its original settings. */
+export async function regenerateJob(id: string): Promise<void> {
+  await apiFetch(`/api/v1/jobs/${encodeURIComponent(id)}/regenerate`, { method: 'POST' })
+}
+
 // ── Automations API ──────────────────────────────────────────────────────────
 
 export const listTriggers = (): Promise<Trigger[]> =>

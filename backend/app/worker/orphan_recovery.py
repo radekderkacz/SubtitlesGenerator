@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 # as orphaned. The fastest legitimate phase transition (extracting → end of
 # transcribing) writes an update within ~5-10s, so 30s gives ample margin
 # while still recovering quickly after a deploy.
-ORPHAN_AGE_SECONDS = 30
+# Above the worker's 60s heartbeat (tasks._job_heartbeat) with slack for a
+# slow DB write — a live job is never silent longer than ~2 heartbeats.
+ORPHAN_AGE_SECONDS = 300
 
 
 async def _recover_orphans() -> int:

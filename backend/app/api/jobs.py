@@ -53,6 +53,7 @@ async def _announce_created(job) -> None:
     response_model=JobSubmitResponse,
     responses={
         400: {"description": "Path outside NAS mount"},
+        409: {"description": "An active job already exists for this file"},
         422: {"description": "System not configured"},
     },
 )
@@ -74,6 +75,14 @@ async def create_job(payload: JobCreate, session: DbSession):
             content={
                 "detail": f"AI profile '{e}' not found — create it in Settings → Profiles.",
                 "code": "PROFILE_NOT_FOUND",
+            },
+        )
+    except job_service.DuplicateJobError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "A job for this file is already queued or running.",
+                "code": "JOB_ALREADY_ACTIVE",
             },
         )
     # Announce the new queued job so an already-open Queue (the SSE stream is
@@ -155,6 +164,28 @@ async def retry_job(job_id: str, session: DbSession):
             status_code=status,
             content={"detail": str(e), "code": e.code},
         )
+    generate_subtitles.delay(new_job.id)
+    await _announce_created(new_job)
+    return new_job
+
+
+@router.post(
+    "/jobs/{job_id}/regenerate",
+    status_code=202,
+    response_model=JobSubmitResponse,
+    responses={
+        400: {"description": "Source job is not finished yet"},
+        404: {"description": "Source job not found"},
+        409: {"description": "A job for this file is already active"},
+    },
+)
+async def regenerate_job_endpoint(job_id: str, session: DbSession):
+    """Re-queue a finished job's file using its original settings snapshot."""
+    try:
+        new_job = await job_service.regenerate_job(session, job_id)
+    except job_service.RegenerateError as e:
+        status = {"JOB_NOT_FOUND": 404, "JOB_NOT_TERMINAL": 400, "ALREADY_ACTIVE": 409}.get(e.code, 400)
+        return JSONResponse(status_code=status, content={"detail": str(e), "code": e.code})
     generate_subtitles.delay(new_job.id)
     await _announce_created(new_job)
     return new_job

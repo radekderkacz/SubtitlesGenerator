@@ -110,3 +110,21 @@ async def test_record_missing_path_adds_trigger_event():
     await _record_missing_path(session, "t1", {"source": "sonarr"}, "10.0.0.1")
     session.add.assert_called_once()
     session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_webhook_400_on_malformed_json(client):
+    """WS5: a body that isn't JSON answers 400, not a 500 traceback."""
+    trig = MagicMock(id="t1", type="webhook", webhook_secret="s" * 64)
+    with (
+        patch("app.api.webhooks.trigger_service.get_trigger",
+              new=AsyncMock(return_value=trig)),
+    ):
+        r = await client.post(
+            "/api/v1/triggers/t1/webhook",
+            content=b"this is not json{{{",
+            headers={"Authorization": "Bearer " + "s" * 64,
+                     "Content-Type": "application/json"},
+        )
+    assert r.status_code == 400
+    assert r.json()["code"] == "WEBHOOK_BAD_JSON"

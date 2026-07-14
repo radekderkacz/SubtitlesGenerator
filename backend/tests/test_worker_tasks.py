@@ -14,9 +14,11 @@ from app.worker.tasks import (
     _guard_remote_audio_size,
     _job_backend,
     _output_srt_path,
+    _parse_batch_response,
     _resolve_litellm_target,
-
     _segments_to_srt,
+    _translate_batch_blocking,
+    _translate_segment_blocking,
 )
 
 
@@ -45,6 +47,15 @@ def _stub_run_verification(request):
         return
     with patch("app.worker.tasks.run_verification", AsyncMock()):
         yield
+
+
+def _cas_via(mock_update):
+    """Route the WS5 compare-and-set completion through a test's _update_job
+    mock (the mocked job is always 'processing'; the CAS race is covered by
+    its own dedicated test)."""
+    async def _cas(job_id, **fields):
+        return await mock_update(job_id, **fields)
+    return _cas
 
 
 def _make_job(**kwargs):
@@ -94,6 +105,7 @@ async def test_pipeline_happy_path(tmp_path):
     with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=[])), \
          patch("app.worker.tasks._write_srt_for", AsyncMock(return_value="/tmp/test.srt")), \
@@ -159,6 +171,7 @@ async def test_pipeline_exception_marks_job_failed(tmp_path):
     with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=[])), \
          patch("app.worker.tasks._write_srt_for", AsyncMock(return_value="/tmp/test.srt")), \
@@ -203,6 +216,7 @@ async def test_pipeline_audio_extraction_happy_path(tmp_path):
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._fetch_settings", mock_fetch_settings), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=[])), \
          patch("app.worker.tasks._write_srt_for", AsyncMock(return_value="/tmp/test.srt")), \
          patch("app.worker.tasks.aioredis.from_url", return_value=mock_redis), \
@@ -250,7 +264,9 @@ async def test_pipeline_ffmpeg_failure_marks_job_failed(tmp_path):
 
     mock_ffmpeg_module = MagicMock()
     mock_ffmpeg_module.Error = FfmpegError
-    mock_ffmpeg_module.input.return_value.output.return_value.overwrite_output.return_value.run.side_effect = (
+    # WS7: extraction selects a stream and builds via module-level
+    # ffmpeg.output(src, ...) rather than input(...).output(...)
+    mock_ffmpeg_module.output.return_value.overwrite_output.return_value.run.side_effect = (
         FfmpegError("ffmpeg", b"", b"Invalid data found")
     )
 
@@ -258,6 +274,7 @@ async def test_pipeline_ffmpeg_failure_marks_job_failed(tmp_path):
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._fetch_settings", mock_fetch_settings), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks.aioredis.from_url", return_value=mock_redis), \
          patch.dict("sys.modules", {"ffmpeg": mock_ffmpeg_module}):
         with pytest.raises(RuntimeError, match="ffmpeg failed"):
@@ -296,6 +313,7 @@ async def test_pipeline_path_traversal_marks_job_failed(tmp_path):
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._fetch_settings", mock_fetch_settings), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks.aioredis.from_url", return_value=mock_redis), \
          patch.dict("sys.modules", {"ffmpeg": MagicMock()}):
         with pytest.raises(RuntimeError, match="outside NAS mount root"):
@@ -335,6 +353,7 @@ async def test_pipeline_translation_skipped_when_no_provider(tmp_path):
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._fetch_settings", mock_fetch_settings), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=[])), \
          patch("app.worker.tasks._write_srt_for", AsyncMock(return_value="/tmp/test.srt")), \
@@ -409,6 +428,7 @@ async def test_pipeline_translation_happy_path(tmp_path):
     with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=segments)), \
          patch("app.worker.tasks._write_srt_for", mock_write_srt_for), \
@@ -428,40 +448,17 @@ async def test_pipeline_translation_happy_path(tmp_path):
     progress_vals = [u.get("progress") for u in updated if "progress" in u]
     assert 65 in progress_vals
     assert 80 in progress_vals
-    # Per-segment heartbeat: with 2 segments, expect an
-    # intermediate progress emit somewhere between 65 (enter) and 80 (exit).
-    # Math: 65 + int(14 * 1/2) = 72 after the first segment.
-    assert 72 in progress_vals
-    assert mock_client.post.call_count == 2
-    call_one = mock_client.post.call_args_list[0]
-    call_two = mock_client.post.call_args_list[1]
-    # Ollama → {api_url}/v1/chat/completions; the litellm ``ollama/`` prefix
-    # is stripped before sending to the upstream endpoint.
-    assert call_one.args[0] == "http://ollama:11434/v1/chat/completions"
-    assert call_one.kwargs["json"]["model"] == "llama3"
-    assert "Authorization" not in call_one.kwargs["headers"]
-
-    # New layered prompt structure: system rules + user line (subtitle-aware
-    # translation prompts follow-up). The system message must carry the
-    # universal rules, and the user message must carry the source line.
-    msgs_one = call_one.kwargs["json"]["messages"]
-    assert msgs_one[0]["role"] == "system"
-    assert "proper noun" in msgs_one[0]["content"].lower()
-    assert msgs_one[1]["role"] == "user"
-    assert "Bonjour" in msgs_one[1]["content"]
-    # First call has no prior pairs, so no continuity-context block.
-    assert "Previous lines" not in msgs_one[1]["content"]
-
-    # Second call must carry the first segment's (source, translation)
-    # pair as continuity context so character names + register stay
-    # consistent across the film.
-    msgs_two = call_two.kwargs["json"]["messages"]
-    assert msgs_two[0]["role"] == "system"
-    assert msgs_two[1]["role"] == "user"
-    assert "Previous lines" in msgs_two[1]["content"]
-    assert "Bonjour" in msgs_two[1]["content"]
-    assert "Hello" in msgs_two[1]["content"]  # the prior translation
-    assert "Merci" in msgs_two[1]["content"]  # the current line
+    # Batched translation: 2 segments go in one chunk (TRANSLATE_BATCH_SIZE=10).
+    # The mock returns non-numbered "Hello" so _parse_batch_response returns None
+    # → per-cue fallback fires (2 _translate_segment_blocking calls). All calls
+    # go to the Ollama endpoint with the llama3 model and no Authorization header.
+    assert mock_client.post.call_count >= 2
+    for call in mock_client.post.call_args_list:
+        # Ollama → {api_url}/v1/chat/completions; the litellm ``ollama/`` prefix
+        # is stripped before sending to the upstream endpoint.
+        assert call.args[0] == "http://ollama:11434/v1/chat/completions"
+        assert call.kwargs["json"]["model"] == "llama3"
+        assert "Authorization" not in call.kwargs["headers"]
 
 
 # ---------------------------------------------------------------------------
@@ -497,8 +494,9 @@ async def test_pipeline_translation_provider_error_marks_job_failed(tmp_path):
 
     mock_redis = AsyncMock()
 
-    # httpx.Client.post always raises ConnectionError — exhausts the 3 retry
-    # attempts and surfaces as a RuntimeError chained from ConnectionError.
+    # httpx.Client.post always raises builtin ConnectionError — classified
+    # terminal (not an httpx transient class) so it fails fast and surfaces
+    # with its own class name (WS3: no more blind 3x retry + rewrap).
     mock_client = MagicMock()
     mock_client.post.side_effect = ConnectionError("connection refused")
     mock_client.__enter__ = MagicMock(return_value=mock_client)
@@ -507,22 +505,22 @@ async def test_pipeline_translation_provider_error_marks_job_failed(tmp_path):
     with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=[{"start": 0.0, "end": 1.0, "text": "Bonjour."}])), \
          patch("app.worker.tasks._write_srt_for", AsyncMock(return_value="/tmp/test.srt")), \
          patch("app.worker.tasks.aioredis.from_url", return_value=mock_redis), \
          patch("httpx.Client", return_value=mock_client):
-        with pytest.raises(RuntimeError, match=r"Translation failed \(openai / gpt-4\): RuntimeError"):
+        with pytest.raises(RuntimeError, match=r"Translation failed \(openai / gpt-4\): ConnectionError"):
             await _async_pipeline("test-job-id")
 
     assert job.status == JobStatus.failed
     assert "Translation failed" in job.error_message
     assert "openai" in job.error_message
     assert "gpt-4" in job.error_message
-    # The wrapper raises RuntimeError after exhausting retries; that's what
-    # the caller sees and chains into the user-visible error message. The
-    # original ConnectionError is preserved as the chained ``__cause__``.
-    assert "RuntimeError" in job.error_message
+    # WS3: the real exception class is surfaced (fail-fast classification);
+    # the original ConnectionError is preserved as the chained ``__cause__``.
+    assert "ConnectionError" in job.error_message
     assert "sk-secret" not in job.error_message
 
 
@@ -562,6 +560,7 @@ async def test_pipeline_translation_no_model_configured_fails_fast(tmp_path):
     with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=[{"text": "x"}])), \
          patch("app.worker.tasks._write_srt_for", AsyncMock(return_value="/tmp/test.srt")), \
@@ -607,6 +606,7 @@ async def test_pipeline_translation_no_target_language_skips_translate(tmp_path)
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._fetch_settings", mock_fetch_settings), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=[{"text": "x"}])), \
          patch("app.worker.tasks._write_srt_for", mock_write_srt_for), \
@@ -659,6 +659,7 @@ async def test_pipeline_translates_with_real_sp2_job_state(tmp_path):
     with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=[{"start": 0.0, "end": 1.0, "text": "Hi"}])), \
          patch("app.worker.tasks._run_translation", mock_run_translation), \
@@ -1038,6 +1039,7 @@ async def test_pipeline_resegments_multisentence_segment_into_cues(tmp_path):
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._fetch_settings", mock_fetch_settings), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=transcription)), \
          patch("app.worker.tasks.aioredis.from_url", return_value=mock_redis):
@@ -1092,6 +1094,7 @@ async def test_pipeline_srt_write_happy_path(tmp_path):
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._fetch_settings", mock_fetch_settings), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=segments)), \
          patch("app.worker.tasks._translate", AsyncMock(return_value=segments)), \
@@ -1147,6 +1150,7 @@ async def test_pipeline_srt_write_atomic_via_temp_and_replace(tmp_path):
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._fetch_settings", mock_fetch_settings), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=[{"start": 0, "end": 1, "text": "ok"}])), \
          patch("app.worker.tasks._translate", AsyncMock(return_value=[{"start": 0, "end": 1, "text": "ok"}])), \
@@ -1192,6 +1196,7 @@ async def test_pipeline_srt_write_rejects_path_traversal_in_language_codes(tmp_p
              patch("app.worker.tasks._fetch_job", mock_fetch), \
              patch("app.worker.tasks._fetch_settings", mock_fetch_settings), \
              patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
              patch("app.worker.tasks._extract_audio", AsyncMock()), \
              patch("app.worker.tasks._transcribe", AsyncMock(return_value=[{"start": 0, "end": 1, "text": "x"}])), \
              patch("app.worker.tasks._translate", AsyncMock(return_value=[{"start": 0, "end": 1, "text": "x"}])), \
@@ -1215,6 +1220,7 @@ async def test_pipeline_srt_write_rejects_path_traversal_in_language_codes(tmp_p
              patch("app.worker.tasks._fetch_job", mock_fetch), \
              patch("app.worker.tasks._fetch_settings", mock_fetch_settings), \
              patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
              patch("app.worker.tasks._extract_audio", AsyncMock()), \
              patch("app.worker.tasks._transcribe", AsyncMock(return_value=[{"start": 0, "end": 1, "text": "x"}])), \
              patch("app.worker.tasks.aioredis.from_url", return_value=mock_redis):
@@ -1252,6 +1258,7 @@ async def test_pipeline_srt_write_overwrites_existing(tmp_path):
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._fetch_settings", mock_fetch_settings), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=[{"start": 0, "end": 1, "text": "NEW"}])), \
          patch("app.worker.tasks._translate", AsyncMock(return_value=[{"start": 0, "end": 1, "text": "NEW"}])), \
@@ -1309,6 +1316,7 @@ async def test_pipeline_aborts_after_extract_when_cancelled(tmp_path):
     with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=[])), \
          patch("app.worker.tasks._write_srt_for", AsyncMock(return_value="/tmp/test.srt")), \
@@ -1593,6 +1601,7 @@ async def test_pipeline_writes_source_then_target_srt_when_translating(tmp_path)
     with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=src_segments)), \
          patch("app.worker.tasks._translate", AsyncMock(return_value=tgt_segments)), \
@@ -1641,6 +1650,7 @@ async def test_pipeline_writes_only_source_srt_when_not_translating(tmp_path):
     with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
          patch("app.worker.tasks._fetch_job", mock_fetch), \
          patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
          patch("app.worker.tasks._extract_audio", AsyncMock()), \
          patch("app.worker.tasks._transcribe", AsyncMock(return_value=src_segments)), \
          patch("app.worker.tasks._write_srt_for", mock_write_srt_for), \
@@ -1709,17 +1719,21 @@ async def test_run_translation_accumulates_and_persists_usage(tmp_path, monkeypa
             setattr(job, k, v)
         updates.append(dict(fields)); return job
     monkeypatch.setattr(t, "_update_job", mock_update)
+    # WS5: the batch loop polls job status per batch for cancellation
+    monkeypatch.setattr(t, "_fetch_job", AsyncMock(return_value=job))
     monkeypatch.setattr(t, "_publish_event", AsyncMock())
     monkeypatch.setattr(t, "_write_log", lambda *a, **k: None)
 
-    async def fake_glossary(loop, segments, mapped_model, base_url, api_key, log_path, job_id):
-        return ["Spider"], {"usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6, "cost": 0.001}}
-    monkeypatch.setattr(t, "_extract_and_log_glossary", fake_glossary)
+    async def fake_bible(loop, segments, mapped_model, base_url, api_key, log_path, job_id, target_language):
+        return ({"names": ["Spider"]},
+                [{"usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6, "cost": 0.001}}])
+    monkeypatch.setattr(t, "_extract_film_bible", fake_bible)
 
-    async def fake_one(loop, segment, *, acc, **kw):
-        segment["text"] = "T:" + segment["text"]
-        acc.add(Usage(3, 2, 5, 0.002))
-    monkeypatch.setattr(t, "_translate_one_segment", fake_one)
+    async def fake_batch(loop, chunk, tgt=None, *, acc, **kw):
+        for segment in chunk:
+            segment["text"] = "T:" + segment["text"]
+            acc.add(Usage(3, 2, 5, 0.002))
+    monkeypatch.setattr(t, "_translate_batch", fake_batch)
 
     segs = [{"text": "a"}, {"text": "b"}]
     await t._run_translation(job, "jid", segs, str(tmp_path / "l.log"), AsyncMock())
@@ -1733,3 +1747,919 @@ async def test_run_translation_accumulates_and_persists_usage(tmp_path, monkeypa
     assert abs(f["cost_usd"] - (0.001 + 0.002 * 2)) < 1e-9
     assert f["translation_provider"] == "openrouter"
     assert f["translation_model"] == "google/gemini-2.0-flash-001"
+
+
+# ---------------------------------------------------------------------------
+# Task 2: _parse_batch_response
+# ---------------------------------------------------------------------------
+
+def test_parse_batch_aligned():
+    raw = "1. Cześć.\n2. Jak się masz?\n3. Dobrze."
+    assert _parse_batch_response(raw, 3) == ["Cześć.", "Jak się masz?", "Dobrze."]
+
+
+def test_parse_batch_tolerates_fences_and_prose():
+    raw = "```\nSure:\n1. A\n2. B\n```"
+    assert _parse_batch_response(raw, 2) == ["A", "B"]
+
+
+def test_parse_batch_wrong_count_returns_none():
+    assert _parse_batch_response("1. A\n2. B", 3) is None
+
+
+def test_parse_batch_missing_number_returns_none():
+    assert _parse_batch_response("1. A\n3. C", 3) is None
+
+
+def test_parse_batch_blank_translation_returns_none():
+    assert _parse_batch_response("1. A\n2.   \n3. C", 3) is None
+
+
+# ---------------------------------------------------------------------------
+# Task 3: _translate_batch
+# ---------------------------------------------------------------------------
+
+import asyncio
+from app.worker import tasks
+
+
+async def test_translate_batch_assigns_on_aligned(monkeypatch):
+    chunk = [{"text": "Hello."}, {"text": "Bye."}]
+    monkeypatch.setattr(tasks, "_translate_batch_blocking",
+                        lambda *a, **k: (["Cześć.", "Pa."], "1. Cześć.\n2. Pa.", {"usage": {}}))
+    acc = tasks.UsageAccumulator()
+    tgt = tasks._TranslateTarget(provider="ollama", model="m", mapped_model="m",
+                                 base_url=None, api_key=None, target_language="pl")
+    await tasks._translate_batch(
+        asyncio.get_running_loop(), chunk, tgt, context_pairs=[], acc=acc,
+    )
+    assert [c["text"] for c in chunk] == ["Cześć.", "Pa."]
+
+
+async def test_translate_batch_falls_back_per_cue_on_misalignment(monkeypatch):
+    chunk = [{"text": "Hello."}, {"text": "Bye."}]
+    monkeypatch.setattr(tasks, "_translate_batch_blocking", lambda *a, **k: (None, "junk", {}))
+    called = []
+
+    async def fake_one(loop, segment, tgt=None, **kw):
+        called.append(segment["text"])
+        segment["text"] = "X"
+    monkeypatch.setattr(tasks, "_translate_one_segment", fake_one)
+    acc = tasks.UsageAccumulator()
+    tgt = tasks._TranslateTarget(provider="ollama", model="m", mapped_model="m",
+                                 base_url=None, api_key=None, target_language="pl")
+    await tasks._translate_batch(
+        asyncio.get_running_loop(), chunk, tgt, context_pairs=[], acc=acc,
+    )
+    assert called == ["Hello.", "Bye."]
+    assert [c["text"] for c in chunk] == ["X", "X"]
+
+
+# ---------------------------------------------------------------------------
+# Translation temperature pinning
+# ---------------------------------------------------------------------------
+
+def test_glossary_request_pins_low_temperature():
+    mock_client = _glossary_mock_client('[]')
+    with patch("httpx.Client", return_value=mock_client):
+        _extract_glossary_blocking("some source text", "ollama/x", "http://x", None)
+    body = mock_client.post.call_args.kwargs["json"]
+    assert body["temperature"] == 0.2
+
+
+def test_segment_translation_request_pins_low_temperature():
+    mock_client = _glossary_mock_client("Bonjour")
+    with patch("httpx.Client", return_value=mock_client):
+        _translate_segment_blocking("Hello", "ollama/x", "http://x", None, "fr")
+    body = mock_client.post.call_args.kwargs["json"]
+    assert body["temperature"] == 0.2
+
+
+def test_batch_translation_request_pins_low_temperature():
+    mock_client = _glossary_mock_client("1. Bonjour")
+    with patch("httpx.Client", return_value=mock_client):
+        _translate_batch_blocking(["Hello"], "ollama/x", "http://x", None, "fr")
+    body = mock_client.post.call_args.kwargs["json"]
+    assert body["temperature"] == 0.2
+
+
+# ---------------------------------------------------------------------------
+# WS2 (2026-07 audit): ASR quality filters, language hint, suffix normalization
+# ---------------------------------------------------------------------------
+
+def test_remote_blocking_sends_language_hint_and_keeps_confidence(monkeypatch, tmp_path):
+    """The user's source-language hint is sent to the transcriber and the
+    confidence fields survive the segment reduction."""
+    import app.worker.tasks as t
+    mp3 = str(tmp_path / "j.remote.mp3"); open(mp3, "wb").write(b"AUDIO")
+    monkeypatch.setattr(t, "_compress_audio_for_remote", lambda w: mp3)
+    monkeypatch.setattr(t, "_guard_remote_audio_size", lambda p: None)
+    monkeypatch.setattr(t, "_wait_remote_ready", lambda url, **k: None)
+
+    captured = {}
+    class Resp:
+        def raise_for_status(self): pass
+        def json(self): return {"language": "pl", "segments": [
+            {"start": 0.0, "end": 1.0, "text": "hej",
+             "no_speech_prob": 0.9, "avg_logprob": -0.2, "compression_ratio": 1.1}]}
+    class Client:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, url, headers=None, files=None, data=None):
+            captured["data"] = data
+            return Resp()
+    monkeypatch.setattr(t.httpx, "Client", Client)
+
+    out = t._run_transcription_remote_blocking(
+        str(tmp_path / "j.wav"), "https://x/v1", "large-v3", None, language_hint="pl")
+    assert captured["data"]["language"] == "pl"
+    seg = out["segments"][0]
+    assert seg["no_speech_prob"] == 0.9
+    assert seg["avg_logprob"] == -0.2
+    assert seg["compression_ratio"] == 1.1
+
+
+def test_remote_blocking_omits_language_without_hint(monkeypatch, tmp_path):
+    import app.worker.tasks as t
+    mp3 = str(tmp_path / "j.remote.mp3"); open(mp3, "wb").write(b"AUDIO")
+    monkeypatch.setattr(t, "_compress_audio_for_remote", lambda w: mp3)
+    monkeypatch.setattr(t, "_guard_remote_audio_size", lambda p: None)
+    monkeypatch.setattr(t, "_wait_remote_ready", lambda url, **k: None)
+    captured = {}
+    class Resp:
+        def raise_for_status(self): pass
+        def json(self): return {"language": "en", "segments": [{"start": 0, "end": 1, "text": "hi"}]}
+    class Client:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, url, headers=None, files=None, data=None):
+            captured["data"] = data
+            return Resp()
+    monkeypatch.setattr(t.httpx, "Client", Client)
+    t._run_transcription_remote_blocking(str(tmp_path / "j.wav"), "https://x/v1", "m", None)
+    assert "language" not in captured["data"]
+
+
+def test_postprocess_no_speech_raises():
+    import app.worker.tasks as t
+    with pytest.raises(RuntimeError, match="No speech detected"):
+        t._postprocess_transcription({"language": "en", "segments": [], "words": []}, None)
+
+
+def test_postprocess_all_segments_filtered_raises():
+    import app.worker.tasks as t
+    result = {"language": "en", "words": [],
+              "segments": [{"start": 0.0, "end": 2.0, "text": "Thanks for watching!"}]}
+    with pytest.raises(RuntimeError, match="No speech detected"):
+        t._postprocess_transcription(result, None)
+
+
+def test_postprocess_prefers_user_hint_and_normalizes():
+    import app.worker.tasks as t
+    result = {"language": "english", "words": [],
+              "segments": [{"start": 0.0, "end": 2.0, "text": "Real line."}]}
+    _, _, lang = t._postprocess_transcription(dict(result), "pl")
+    assert lang == "pl"
+    _, _, lang = t._postprocess_transcription(dict(result), None)
+    assert lang == "en"
+
+
+def test_postprocess_filters_words_inside_dropped_ranges():
+    import app.worker.tasks as t
+    segments = ([{"start": float(i), "end": i + 0.9, "text": "Loop line here."} for i in range(6)]
+                + [{"start": 10.0, "end": 11.0, "text": "Real."}])
+    words = ([{"text": "Loop", "start": float(i), "end": i + 0.4} for i in range(6)]
+             + [{"text": "Real.", "start": 10.0, "end": 10.5}])
+    result = {"language": "en", "segments": segments, "words": words}
+    out, dropped, _ = t._postprocess_transcription(result, None)
+    assert len(out["segments"]) == 3  # 2 of the loop + Real.
+    kept_words = [w["text"] for w in out["words"]]
+    assert "Real." in kept_words
+    assert len(kept_words) == 3  # words in dropped ranges removed
+    assert all(d["reason"] == "repeat_loop" for d in dropped)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_normalizes_language_suffix(tmp_path):
+    """A provider-style full language name ('english') must yield Movie.en.srt."""
+    nas = tmp_path
+    video = nas / "Film.mkv"
+    video.touch()
+    job = _make_job(file_path=str(video), source_language="english", target_language=None)
+    settings = MagicMock()
+    settings.nas_mount_path = str(nas)
+
+    async def mock_fetch(job_id): return job
+    async def mock_fetch_settings(): return settings
+    async def mock_update(job_id, **fields):
+        for k, v in fields.items(): setattr(job, k, v)
+        return job
+
+    transcription = {"language": "english", "segments": [
+        {"start": 0.0, "end": 3.0, "text": "One line here."}], "words": []}
+    with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
+         patch("app.worker.tasks._fetch_job", mock_fetch), \
+         patch("app.worker.tasks._fetch_settings", mock_fetch_settings), \
+         patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
+         patch("app.worker.tasks._extract_audio", AsyncMock()), \
+         patch("app.worker.tasks._transcribe", AsyncMock(return_value=transcription)), \
+         patch("app.worker.tasks.aioredis.from_url", return_value=AsyncMock()):
+        result = await _async_pipeline("test-job-id")
+
+    assert result["status"] == JobStatus.completed
+    assert (nas / "Film.en.srt").exists()
+    assert not (nas / "Film.english.srt").exists()
+
+
+# ---------------------------------------------------------------------------
+# WS3 (2026-07 audit): transport hardening + output validation
+# ---------------------------------------------------------------------------
+
+def _chat_resp_client(monkeypatch, contents, statuses=None, finish_reasons=None):
+    """Client mock returning a sequence of chat replies; records bodies."""
+    import app.worker.tasks as t
+    state = {"calls": 0, "bodies": []}
+    contents = list(contents)
+    statuses = list(statuses or [200] * len(contents))
+    finish_reasons = list(finish_reasons or ["stop"] * len(contents))
+
+    class Client:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, url, headers=None, json=None):
+            i = min(state["calls"], len(contents) - 1)
+            state["calls"] += 1
+            state["bodies"].append(json)
+            status = statuses[i]
+            req = t.httpx.Request("POST", url)
+            if status != 200:
+                return t.httpx.Response(status, request=req, json={})
+            return t.httpx.Response(200, request=req, json={
+                "choices": [{"message": {"content": contents[i]},
+                             "finish_reason": finish_reasons[i]}]})
+    monkeypatch.setattr(t.httpx, "Client", Client)
+    return state
+
+
+def test_post_translation_strips_think_tags(monkeypatch):
+    import app.worker.tasks as t
+    _chat_resp_client(monkeypatch, ["<think>Let me reason. 1. no</think>\n1. Cześć"])
+    content, _ = t._post_translation_with_retries("http://x", {}, {})
+    assert content == "1. Cześć"
+
+
+def test_post_translation_drops_unclosed_think(monkeypatch):
+    import app.worker.tasks as t
+    _chat_resp_client(monkeypatch, ["<think>rambling forever"])
+    with pytest.raises(Exception):
+        t._post_translation_with_retries("http://x", {}, {})
+
+
+def test_post_translation_fails_fast_on_401(monkeypatch):
+    import app.worker.tasks as t
+    state = _chat_resp_client(monkeypatch, ["never"], statuses=[401])
+    with pytest.raises(Exception):
+        t._post_translation_with_retries("http://x", {}, {})
+    assert state["calls"] == 1  # terminal 4xx must not be hammered 3x
+
+
+def test_post_translation_retries_transient_with_backoff(monkeypatch):
+    import app.worker.tasks as t
+    sleeps = []
+    monkeypatch.setattr(t.time, "sleep", lambda s: sleeps.append(s))
+    state = _chat_resp_client(monkeypatch, ["x", "x", "1. OK"], statuses=[503, 503, 200])
+    content, _ = t._post_translation_with_retries("http://x", {}, {})
+    assert content == "1. OK"
+    assert state["calls"] == 3
+    assert len(sleeps) == 2 and all(s > 0 for s in sleeps)
+
+
+def test_batch_blocking_sets_max_tokens_and_returns_raw(monkeypatch):
+    import app.worker.tasks as t
+    state = _chat_resp_client(monkeypatch, ["1. Bonjour"])
+    parsed, raw, data = t._translate_batch_blocking(["Hello"], "ollama/x", "http://x", None, "fr")
+    assert parsed == ["Bonjour"]
+    assert raw == "1. Bonjour"
+    assert state["bodies"][0]["max_tokens"] >= 128
+
+
+def test_batch_blocking_truncated_reply_is_misaligned(monkeypatch):
+    import app.worker.tasks as t
+    _chat_resp_client(monkeypatch, ["1. Bonjour"], finish_reasons=["length"])
+    parsed, raw, data = t._translate_batch_blocking(["Hello"], "ollama/x", "http://x", None, "fr")
+    assert parsed is None
+
+
+def test_parse_batch_response_duplicate_numbers_is_failure():
+    from app.worker.tasks import _parse_batch_response
+    assert _parse_batch_response("1. a\n1. b\n2. c", 2) is None
+
+
+async def test_translate_batch_corrective_reask_recovers(monkeypatch):
+    import app.worker.tasks as t
+    chunk = [{"text": "Hello."}, {"text": "Bye."}]
+    calls = []
+
+    def fake_blocking(texts, mapped_model, base_url, api_key, target_language,
+                      context_pairs=None, glossary=None, source_language=None,
+                      prior_reply=None, bible=None, story_so_far=None):
+        calls.append(prior_reply)
+        if prior_reply is None:
+            return None, "1. Cześć. 2. Pa.", {}   # single-line mess
+        return ["Cześć.", "Pa."], "1. Cześć.\n2. Pa.", {}
+    monkeypatch.setattr(t, "_translate_batch_blocking", fake_blocking)
+    per_cue = []
+
+    async def fake_one(loop, segment, **kw):
+        per_cue.append(segment["text"])
+    monkeypatch.setattr(t, "_translate_one_segment", fake_one)
+    acc = t.UsageAccumulator()
+    tgt = t._TranslateTarget(provider="ollama", model="m", mapped_model="m",
+                       base_url=None, api_key=None, target_language="pl")
+    await t._translate_batch(
+        asyncio.get_running_loop(), chunk, tgt, context_pairs=[], acc=acc,
+    )
+    assert [c["text"] for c in chunk] == ["Cześć.", "Pa."]
+    assert calls == [None, "1. Cześć. 2. Pa."]  # exactly one corrective re-ask
+    assert per_cue == []                         # no per-cue fallback needed
+
+
+def test_clean_single_translation_rules():
+    from app.worker.tasks import _clean_single_translation
+    assert _clean_single_translation("Hello.", '"Cześć."') == "Cześć."
+    assert _clean_single_translation("Hello.", "I'm sorry, I cannot translate that.") is None
+    assert _clean_single_translation("Hello.", "Here is the translation: Cześć.") is None
+    assert _clean_single_translation("Hello.", "") is None
+    assert _clean_single_translation("Hi", "x" * 500) is None
+    assert _clean_single_translation("Hello.", "Cześć.") == "Cześć."
+
+
+async def test_translate_one_segment_retries_refusal_then_keeps_source(monkeypatch):
+    import app.worker.tasks as t
+    replies = ["I'm sorry, I can't help with that.", "I'm sorry, no."]
+
+    def fake_seg_blocking(text, mapped_model, base_url, api_key, target_language,
+                          context_pairs=None, glossary=None, source_language=None,
+                          prior_reply=None, bible=None):
+        return replies.pop(0), {}
+    monkeypatch.setattr(t, "_translate_segment_blocking", fake_seg_blocking)
+    seg = {"text": "Shoot him!"}
+    acc = t.UsageAccumulator()
+    tgt = t._TranslateTarget(provider="ollama", model="m", mapped_model="m",
+                       base_url=None, api_key=None, target_language="pl")
+    await t._translate_one_segment(asyncio.get_running_loop(), seg, tgt, acc=acc)
+    assert seg["text"] == "Shoot him!"  # source kept, refusal never shipped
+    assert replies == []                # exactly two attempts
+
+
+def test_film_bible_chunks_long_transcripts(monkeypatch):
+    import app.worker.tasks as t
+    state = _chat_resp_client(monkeypatch, ['{"names": ["Jake"], "characters": [], "terms": {}, "setting": "", "register": ""}'])
+    long_text = ("Some dialogue line here.\n" * 800)  # ~20k chars
+    segs = [{"text": ln} for ln in long_text.splitlines()]
+
+    async def run():
+        return await t._extract_film_bible(
+            asyncio.get_running_loop(), segs, "ollama/x", "http://x", None,
+            "/tmp/x.log", "jid", "pl")
+    import asyncio as aio
+    monkeypatch.setattr(t, "_write_log", lambda *a, **k: None)
+    bible, datas = aio.run(run())
+    assert bible["names"] == ["Jake"]
+    assert state["calls"] >= 3          # chunked, not one giant prompt
+    assert isinstance(datas, list) and len(datas) == state["calls"]
+
+
+# ---------------------------------------------------------------------------
+# WS5 (2026-07 audit): pipeline entry guard + CAS completion + cancel-in-loop
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pipeline_noops_on_redelivered_completed_job(tmp_path):
+    """A redelivered Celery message for a completed job must NOT re-run the
+    pipeline (acks_late + 24h visibility timeout redeliveries are real)."""
+    job = _make_job(file_path="/media/Film.mkv", source_language="en", target_language=None)
+    job.status = JobStatus.completed
+    extract = AsyncMock()
+    with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
+         patch("app.worker.tasks._fetch_job", AsyncMock(return_value=job)), \
+         patch("app.worker.tasks._extract_audio", extract), \
+         patch("app.worker.tasks.aioredis.from_url", return_value=AsyncMock()):
+        result = await _async_pipeline("test-job-id")
+    assert result["status"] == JobStatus.completed
+    extract.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_noops_on_processing_job(tmp_path):
+    """status=processing means another worker owns the job — orphan recovery
+    (which flips it to queued first) is the only sanctioned re-entry."""
+    job = _make_job(file_path="/media/Film.mkv", source_language="en", target_language=None)
+    job.status = JobStatus.processing
+    extract = AsyncMock()
+    with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
+         patch("app.worker.tasks._fetch_job", AsyncMock(return_value=job)), \
+         patch("app.worker.tasks._extract_audio", extract), \
+         patch("app.worker.tasks.aioredis.from_url", return_value=AsyncMock()):
+        result = await _async_pipeline("test-job-id")
+    assert result["status"] == JobStatus.processing
+    extract.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_completion_is_compare_and_set(tmp_path):
+    """A cancel that lands between the last phase and the terminal write must
+    win — completed is only written over status=processing."""
+    import app.worker.tasks as t
+    calls = {}
+
+    async def fake_complete(job_id, **fields):
+        calls["fields"] = fields
+        return None  # 0 rows updated -> job was cancelled mid-flight
+
+    nas = tmp_path
+    video = nas / "Film.mkv"; video.touch()
+    job = _make_job(file_path=str(video), source_language="en", target_language=None)
+    settings = MagicMock(); settings.nas_mount_path = str(nas)
+
+    async def mock_update(job_id, **fields):
+        for k, v in fields.items(): setattr(job, k, v)
+        return job
+
+    transcription = {"language": "en", "segments": [
+        {"start": 0.0, "end": 3.0, "text": "One line."}], "words": []}
+    with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
+         patch("app.worker.tasks._fetch_job", AsyncMock(return_value=job)), \
+         patch("app.worker.tasks._fetch_settings", AsyncMock(return_value=settings)), \
+         patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
+         patch("app.worker.tasks._complete_job_if_processing", fake_complete), \
+         patch("app.worker.tasks._extract_audio", AsyncMock()), \
+         patch("app.worker.tasks._transcribe", AsyncMock(return_value=transcription)), \
+         patch("app.worker.tasks.aioredis.from_url", return_value=AsyncMock()):
+        result = await _async_pipeline("test-job-id")
+    assert result["status"] == JobStatus.cancelled
+    assert calls["fields"]["status"] == JobStatus.completed  # attempted CAS
+
+
+@pytest.mark.asyncio
+async def test_translation_loop_stops_on_cancel(monkeypatch, tmp_path):
+    """Cancelling mid-translation stops the batch loop within one batch —
+    no more paying the LLM for a cancelled job's remaining 80 batches."""
+    import app.worker.tasks as t
+    job = _make_job(file_path="/m/F.mkv", source_language="en", target_language="pl")
+    job.backend_profile = {"translation_provider": "ollama", "translation_model": "m",
+                           "translation_api_url": "http://x", "translation_api_key": None}
+    segments = [{"start": float(i), "end": i + 1.0, "text": f"Line {i}."} for i in range(40)]
+    batches = {"n": 0}
+
+    async def fake_batch(loop, chunk, tgt=None, **kw):
+        batches["n"] += 1
+        for seg in chunk: seg["text"] = "T:" + seg["text"]
+    cancelled_after = 1
+    status_reads = {"n": 0}
+
+    async def fake_fetch(job_id):
+        status_reads["n"] += 1
+        if batches["n"] >= cancelled_after:
+            job.status = JobStatus.cancelled
+        return job
+
+    async def fake_update(job_id, **fields):
+        for k, v in fields.items(): setattr(job, k, v)
+        return job
+
+    monkeypatch.setattr(t, "_translate_batch", fake_batch)
+    monkeypatch.setattr(t, "_fetch_job", fake_fetch)
+    monkeypatch.setattr(t, "_update_job", fake_update)
+    monkeypatch.setattr(t, "_publish_event", AsyncMock())
+    monkeypatch.setattr(t, "_write_log", lambda *a, **k: None)
+
+    async def fake_bible(loop, segs, mm, bu, ak, lp, jid, tl):
+        return {}, []
+    monkeypatch.setattr(t, "_extract_film_bible", fake_bible)
+
+    with pytest.raises(t._JobCancelled):
+        await t._run_translation(job, "jid", segments, str(tmp_path / "l.log"), AsyncMock())
+    assert batches["n"] <= 2  # stopped within one batch of the cancel
+
+
+# ---------------------------------------------------------------------------
+# WS6 (2026-07 audit): VAD pre-filter wiring
+# ---------------------------------------------------------------------------
+
+def test_postprocess_uses_speech_regions():
+    import app.worker.tasks as t
+    result = {"language": "en", "words": [], "segments": [
+        {"start": 1.0, "end": 3.0, "text": "Real line."},
+        {"start": 100.0, "end": 102.0, "text": "Thanks for hallucinating!"}]}
+    out, dropped, _ = t._postprocess_transcription(result, None, speech_regions=[(0.5, 3.5)])
+    assert [s["text"] for s in out["segments"]] == ["Real line."]
+    assert dropped[0]["reason"] == "no_speech_region"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_runs_vad_and_filters_silence_segments(tmp_path):
+    nas = tmp_path
+    video = nas / "Film.mkv"; video.touch()
+    job = _make_job(file_path=str(video), source_language="en", target_language=None)
+    settings = MagicMock(); settings.nas_mount_path = str(nas)
+
+    async def mock_update(job_id, **fields):
+        for k, v in fields.items(): setattr(job, k, v)
+        return job
+
+    transcription = {"language": "en", "words": [], "segments": [
+        {"start": 0.5, "end": 3.0, "text": "Spoken line here."},
+        {"start": 200.0, "end": 202.0, "text": "Silence hallucination."}]}
+    with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
+         patch("app.worker.tasks._fetch_job", AsyncMock(return_value=job)), \
+         patch("app.worker.tasks._fetch_settings", AsyncMock(return_value=settings)), \
+         patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
+         patch("app.worker.tasks._extract_audio", AsyncMock()), \
+         patch("app.worker.tasks.detect_speech_regions", return_value=[(0.0, 4.0)]), \
+         patch("app.worker.tasks._run_transcription_remote_blocking",
+               return_value=transcription), \
+         patch("app.worker.tasks.aioredis.from_url", return_value=AsyncMock()):
+        result = await _async_pipeline("test-job-id")
+
+    assert result["status"] == JobStatus.completed
+    srt = (nas / "Film.en.srt").read_text()
+    assert "Spoken line here." in srt
+    assert "Silence hallucination." not in srt
+    # regions persisted for the sync self-check
+    assert (tmp_path / "test-job-id.vad.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# WS7 (2026-07 audit): explicit audio-stream selection at extraction
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_extract_audio_maps_language_matched_stream(tmp_path):
+    """ffmpeg must be told WHICH audio stream to use — its default picks the
+    most-channels stream (5.1 dub/commentary) over the stereo original."""
+    job = _make_job(file_path="/media/Film.mkv", source_language="en")
+    settings = MagicMock(); settings.nas_mount_path = "/media"
+
+    async def mock_update(job_id, **fields):
+        for k, v in fields.items(): setattr(job, k, v)
+        return job
+
+    fake_ffmpeg = MagicMock()
+    fake_ffmpeg.probe.return_value = {"streams": [
+        {"index": 0, "codec_type": "video"},
+        {"index": 1, "codec_type": "audio", "channels": 6,
+         "tags": {"language": "fre"}, "disposition": {"default": 1}},
+        {"index": 2, "codec_type": "audio", "channels": 2,
+         "tags": {"language": "eng"}, "disposition": {"default": 0}},
+    ]}
+    selected = {}
+    inp = MagicMock()
+    inp.__getitem__ = MagicMock(side_effect=lambda spec: selected.setdefault("spec", spec) or MagicMock())
+    fake_ffmpeg.input.return_value = inp
+
+    from app.worker.tasks import _extract_audio
+    with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
+         patch("app.worker.tasks._fetch_settings", AsyncMock(return_value=settings)), \
+         patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._publish_event", AsyncMock()), \
+         patch.dict("sys.modules", {"ffmpeg": fake_ffmpeg}):
+        await _extract_audio(job, "jid", str(tmp_path / "a.wav"), str(tmp_path / "l.log"), AsyncMock())
+
+    assert selected["spec"] == "a:1"  # the English stereo track, not the French 5.1
+
+
+# ---------------------------------------------------------------------------
+# WS8 (2026-07 audit): scene batching + film bible + story summary
+# ---------------------------------------------------------------------------
+
+def test_batch_cues_by_scene_splits_on_gaps():
+    import app.worker.tasks as t
+    segs = ([{"start": float(i), "end": i + 0.9, "text": f"A{i}"} for i in range(8)]
+            + [{"start": 60.0 + i, "end": 60.9 + i, "text": f"B{i}"} for i in range(6)])
+    batches = t.batch_cues_by_scene(segs)
+    assert len(batches) == 2
+    assert [s["text"] for s in batches[0]] == [f"A{i}" for i in range(8)]
+
+
+def test_batch_cues_by_scene_caps_batch_size():
+    import app.worker.tasks as t
+    segs = [{"start": float(i), "end": i + 0.9, "text": f"L{i}"} for i in range(40)]
+    batches = t.batch_cues_by_scene(segs)
+    assert all(len(b) <= t.SCENE_BATCH_MAX_CUES for b in batches)
+    assert sum(len(b) for b in batches) == 40
+
+
+def test_batch_cues_by_scene_avoids_tiny_batches_on_gaps():
+    import app.worker.tasks as t
+    # a gap after only 2 cues should NOT start a new batch (min size)
+    segs = ([{"start": 0.0, "end": 0.9, "text": "A"},
+             {"start": 1.0, "end": 1.9, "text": "B"}]
+            + [{"start": 30.0 + i, "end": 30.9 + i, "text": f"C{i}"} for i in range(4)])
+    batches = t.batch_cues_by_scene(segs)
+    assert len(batches) == 1
+
+
+def test_parse_bible_response_tolerates_fences_and_junk():
+    import app.worker.tasks as t
+    raw = 'Sure! ```json\n{"names": ["Jake"], "characters": [{"name": "Jake", "gender": "male"}], "terms": {"the Colonel": "Pułkownik"}, "setting": "War.", "register": "informal"}\n``` hope that helps'
+    bible = t._parse_bible_response(raw)
+    assert bible["names"] == ["Jake"]
+    assert bible["characters"][0]["gender"] == "male"
+    assert bible["terms"]["the Colonel"] == "Pułkownik"
+
+
+def test_parse_bible_response_garbage_gives_empty():
+    import app.worker.tasks as t
+    assert t._parse_bible_response("I refuse.") == {}
+
+
+def test_merge_bibles_first_wins_and_unions():
+    import app.worker.tasks as t
+    a = {"names": ["Jake"], "characters": [{"name": "Jake", "gender": "male"}],
+         "terms": {"Colonel": "Pułkownik"}, "setting": "War.", "register": "informal"}
+    b = {"names": ["Jake", "Neytiri"], "characters": [
+            {"name": "Jake", "gender": "unknown"},
+            {"name": "Neytiri", "gender": "female"}],
+         "terms": {"Colonel": "different", "banshee": "ikran"}, "setting": "", "register": ""}
+    m = t._merge_bibles([a, b])
+    assert m["names"] == ["Jake", "Neytiri"]
+    assert {c["name"]: c["gender"] for c in m["characters"]} == {
+        "Jake": "male", "Neytiri": "female"}
+    assert m["terms"] == {"Colonel": "Pułkownik", "banshee": "ikran"}
+    assert m["setting"] == "War."
+
+
+# ---------------------------------------------------------------------------
+# WS9 (2026-07 audit): transcription checkpoint + heartbeat + resumable batches
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pipeline_resumes_from_transcription_checkpoint(tmp_path):
+    """A job-level retry must NOT re-extract/re-transcribe when the previous
+    attempt already persisted the transcription."""
+    import json as _json
+    nas = tmp_path
+    video = nas / "Film.mkv"; video.touch()
+    job = _make_job(file_path=str(video), source_language="en", target_language=None)
+    settings = MagicMock(); settings.nas_mount_path = str(nas)
+
+    async def mock_update(job_id, **fields):
+        for k, v in fields.items(): setattr(job, k, v)
+        return job
+
+    checkpoint = {"language": "en", "segments": [
+        {"start": 0.0, "end": 3.0, "text": "Line from checkpoint."}], "words": []}
+    (tmp_path / "test-job-id.transcription.json").write_text(_json.dumps(checkpoint))
+
+    extract = AsyncMock(); transcribe = AsyncMock()
+    with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
+         patch("app.worker.tasks._fetch_job", AsyncMock(return_value=job)), \
+         patch("app.worker.tasks._fetch_settings", AsyncMock(return_value=settings)), \
+         patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
+         patch("app.worker.tasks._extract_audio", extract), \
+         patch("app.worker.tasks._transcribe", transcribe), \
+         patch("app.worker.tasks.aioredis.from_url", return_value=AsyncMock()):
+        result = await _async_pipeline("test-job-id")
+
+    assert result["status"] == JobStatus.completed
+    extract.assert_not_called()
+    transcribe.assert_not_called()
+    assert "Line from checkpoint." in (nas / "Film.en.srt").read_text()
+    # terminal success cleans the checkpoint
+    assert not (tmp_path / "test-job-id.transcription.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_writes_checkpoint_after_transcription(tmp_path):
+    import json as _json
+    nas = tmp_path
+    video = nas / "Film.mkv"; video.touch()
+    job = _make_job(file_path=str(video), source_language="en", target_language=None)
+    settings = MagicMock(); settings.nas_mount_path = str(nas)
+    seen = {}
+
+    async def mock_update(job_id, **fields):
+        for k, v in fields.items(): setattr(job, k, v)
+        return job
+
+    async def spying_write_srt(job_, job_id, cues, lang, log_path, redis_client):
+        p = tmp_path / "test-job-id.transcription.json"
+        seen["existed_during_write"] = p.exists()
+        return str(nas / "Film.en.srt")
+
+    transcription = {"language": "en", "segments": [
+        {"start": 0.0, "end": 3.0, "text": "One line."}], "words": []}
+    with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
+         patch("app.worker.tasks._fetch_job", AsyncMock(return_value=job)), \
+         patch("app.worker.tasks._fetch_settings", AsyncMock(return_value=settings)), \
+         patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
+         patch("app.worker.tasks._extract_audio", AsyncMock()), \
+         patch("app.worker.tasks._transcribe", AsyncMock(return_value=transcription)), \
+         patch("app.worker.tasks._write_srt_for", spying_write_srt), \
+         patch("app.worker.tasks.aioredis.from_url", return_value=AsyncMock()):
+        await _async_pipeline("test-job-id")
+    assert seen["existed_during_write"] is True
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_bumps_updated_at_during_blocking_work():
+    import app.worker.tasks as t
+    bumps = []
+
+    async def fake_update(job_id, **fields):
+        bumps.append(fields)
+        return MagicMock()
+    with patch("app.worker.tasks._update_job", fake_update):
+        async with t._job_heartbeat("jid", interval=0.02):
+            await asyncio.sleep(0.09)
+    assert len(bumps) >= 2  # kept the row warm while "working"
+
+
+@pytest.mark.asyncio
+async def test_run_translation_resumes_completed_batches(monkeypatch, tmp_path):
+    """A retry after a mid-translation crash re-uses already-translated
+    batches instead of paying the LLM again."""
+    import json as _json
+    import app.worker.tasks as t
+    job = _make_job(file_path="/m/F.mkv", source_language="en", target_language="pl")
+    job.backend_profile = {"translation_provider": "ollama", "translation_model": "m",
+                           "translation_api_url": "http://x", "translation_api_key": None}
+    segments = [{"start": float(i), "end": i + 0.9, "text": f"Line {i}."} for i in range(20)]
+    batches = t.batch_cues_by_scene(segments)
+    first = batches[0]
+    progress = {"texts": {str(i): f"T:{s['text']}" for i, s in enumerate(segments[:len(first)])}}
+    (tmp_path / "jid.translation.json").write_text(_json.dumps(progress))
+
+    called_batches = []
+
+    async def fake_batch(loop, chunk, tgt=None, **kw):
+        called_batches.append(len(chunk))
+        for seg in chunk: seg["text"] = "NEW:" + seg["text"]
+
+    async def fake_bible(loop, segs, mm, bu, ak, lp, jid, tl):
+        return {}, []
+    monkeypatch.setattr(t, "_translate_batch", fake_batch)
+    monkeypatch.setattr(t, "_extract_film_bible", fake_bible)
+    monkeypatch.setattr(t, "_fetch_job", AsyncMock(return_value=job))
+    monkeypatch.setattr(t, "_update_job", AsyncMock(return_value=job))
+    monkeypatch.setattr(t, "_publish_event", AsyncMock())
+    monkeypatch.setattr(t, "_write_log", lambda *a, **k: None)
+    monkeypatch.setattr(t, "_LOG_DIR", str(tmp_path))
+
+    await t._run_translation(job, "jid", segments, str(tmp_path / "jid.log"), AsyncMock())
+    # first batch restored from the progress file, not re-translated
+    assert segments[0]["text"].startswith("T:")
+    assert sum(called_batches) == 20 - len(first)
+
+
+# ---------------------------------------------------------------------------
+# WS10 (2026-07 audit): language-ID gate wiring
+# ---------------------------------------------------------------------------
+
+async def test_translate_batch_reasks_on_source_language_echo(monkeypatch):
+    import app.worker.tasks as t
+    chunk = [{"text": "Hello there, how are you doing today my friend?"}]
+    replies = [(["Hello there, how are you doing today my friend?"], "1. echo", {}),
+               (["Cześć, jak się dzisiaj miewasz przyjacielu?"], "1. ok", {})]
+
+    def fake_blocking(*a, **k):
+        return replies.pop(0)
+    monkeypatch.setattr(t, "_translate_batch_blocking", fake_blocking)
+    suspects = iter([True, False])
+    monkeypatch.setattr(t, "batch_language_suspect",
+                        lambda texts, tgt, src, **k: next(suspects))
+    acc = t.UsageAccumulator()
+    tgt = t._TranslateTarget(provider="ollama", model="m", mapped_model="m",
+                             base_url=None, api_key=None, target_language="pl",
+                             source_language="en")
+    await t._translate_batch(
+        asyncio.get_running_loop(), chunk, tgt, context_pairs=[], acc=acc,
+    )
+    assert chunk[0]["text"].startswith("Cześć")
+    assert replies == []  # exactly two attempts
+
+
+def test_append_worker_checks_preserves_metrics(tmp_path):
+    import app.worker.tasks as t
+    result = {"status": "pass", "score": 100.0,
+              "report": {"summary": "PASS", "checks": [
+                  {"layer": "structural", "name": "non_empty", "severity": "ok", "detail": ""}],
+                  "metrics": {"cue_count": 1}}}
+    srt = "1\n00:00:01,000 --> 00:00:03,000\nHello.\n"
+    job = _make_job(file_path="/m/F.mkv", target_language=None)
+    with patch("app.worker.tasks._LOG_DIR", str(tmp_path)):
+        out = t._append_worker_checks(result, srt, job)
+    names = [c["name"] for c in out["report"]["checks"]]
+    assert "output_language" in names
+    assert "av_sync" in names
+    assert out["report"]["metrics"] == {"cue_count": 1}
+
+
+# ---------------------------------------------------------------------------
+# WS12 (2026-07 audit): repair pass for suspect translations
+# ---------------------------------------------------------------------------
+
+async def test_failed_validation_marks_cue_for_repair(monkeypatch):
+    import app.worker.tasks as t
+    replies = ["I'm sorry, I can't.", "I'm sorry, no."]
+
+    def fake_seg_blocking(*a, **k):
+        return replies.pop(0), {}
+    monkeypatch.setattr(t, "_translate_segment_blocking", fake_seg_blocking)
+    seg = {"text": "Shoot him!"}
+    acc = t.UsageAccumulator()
+    tgt = t._TranslateTarget(provider="ollama", model="m", mapped_model="m",
+                       base_url=None, api_key=None, target_language="pl")
+    await t._translate_one_segment(asyncio.get_running_loop(), seg, tgt, acc=acc)
+    assert seg["text"] == "Shoot him!"
+    assert seg.get("needs_repair") is True
+
+
+async def test_repair_pass_retranslates_flagged_cues(monkeypatch):
+    import app.worker.tasks as t
+    segments = [{"start": float(i), "end": i + 1.0, "text": f"Linia {i}."} for i in range(6)]
+    segments[2]["needs_repair"] = True
+    segments[4]["needs_repair"] = True
+
+    calls = []
+
+    def fake_seg_blocking(text, *a, **k):
+        calls.append(text)
+        return f"NAPRAWIONE {text}", {}
+    monkeypatch.setattr(t, "_translate_segment_blocking", fake_seg_blocking)
+    acc = t.UsageAccumulator()
+    tgt = t._TranslateTarget(provider="ollama", model="m", mapped_model="m",
+                             base_url=None, api_key=None, target_language="pl",
+                             source_language="en")
+    repaired = await t._repair_pass(
+        asyncio.get_running_loop(), segments, tgt,
+        acc=acc, log_path="/tmp/x.log", job_id="jid",
+    )
+    assert repaired == 2
+    assert segments[2]["text"].startswith("NAPRAWIONE")
+    assert segments[4]["text"].startswith("NAPRAWIONE")
+    assert "needs_repair" not in segments[2]
+    assert len(calls) == 2
+
+
+async def test_repair_pass_caps_volume(monkeypatch):
+    import app.worker.tasks as t
+    segments = [{"start": float(i), "end": i + 1.0, "text": f"Line {i}.", "needs_repair": True}
+                for i in range(300)]
+
+    def fake_seg_blocking(text, *a, **k):
+        return f"OK {text}", {}
+    monkeypatch.setattr(t, "_translate_segment_blocking", fake_seg_blocking)
+    monkeypatch.setattr(t, "_write_log", lambda *a, **k: None)
+    acc = t.UsageAccumulator()
+    tgt = t._TranslateTarget(provider="ollama", model="m", mapped_model="m",
+                             base_url=None, api_key=None, target_language="pl",
+                             source_language="en")
+    repaired = await t._repair_pass(
+        asyncio.get_running_loop(), segments, tgt,
+        acc=acc, log_path="/tmp/x.log", job_id="jid",
+    )
+    assert repaired == t.REPAIR_MAX_CUES
+
+
+# ---------------------------------------------------------------------------
+# WS14 (2026-07 audit): shot-change snapping wiring
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pipeline_snaps_cues_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUBGEN_SHOT_SNAP", "1")
+    nas = tmp_path
+    video = nas / "Film.mkv"; video.touch()
+    job = _make_job(file_path=str(video), source_language="en", target_language=None)
+    settings = MagicMock(); settings.nas_mount_path = str(nas)
+
+    async def mock_update(job_id, **fields):
+        for k, v in fields.items(): setattr(job, k, v)
+        return job
+
+    transcription = {"language": "en", "segments": [
+        {"start": 0.5, "end": 3.7, "text": "A line that ends near a cut."}], "words": []}
+    with patch("app.worker.tasks._LOG_DIR", str(tmp_path)), \
+         patch("app.worker.tasks._fetch_job", AsyncMock(return_value=job)), \
+         patch("app.worker.tasks._fetch_settings", AsyncMock(return_value=settings)), \
+         patch("app.worker.tasks._update_job", mock_update), \
+         patch("app.worker.tasks._complete_job_if_processing", _cas_via(mock_update)), \
+         patch("app.worker.tasks._extract_audio", AsyncMock()), \
+         patch("app.worker.tasks._transcribe", AsyncMock(return_value=transcription)), \
+         patch("app.worker.tasks.detect_shot_changes", return_value=[4.0]), \
+         patch("app.worker.tasks.aioredis.from_url", return_value=AsyncMock()):
+        result = await _async_pipeline("test-job-id")
+    assert result["status"] == JobStatus.completed
+    srt = (nas / "Film.en.srt").read_text()
+    # cue end extended to two frames before the 4.0s cut (3.917)
+    assert "00:00:03,9" in srt

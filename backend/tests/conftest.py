@@ -96,6 +96,9 @@ def mock_session_factory():
         # execute(select(Settings).where(...)) → result.scalar_one_or_none() → settings
         exec_result = MagicMock()
         exec_result.scalar_one_or_none = MagicMock(return_value=settings)
+        # execute(select(Job.id).where(...)) → result.first() → None
+        # (the WS5 active-duplicate pre-check finds no existing job by default)
+        exec_result.first = MagicMock(return_value=None)
         session.execute = AsyncMock(return_value=exec_result)
 
         # session.get(Job, id) → Job instance (or None)

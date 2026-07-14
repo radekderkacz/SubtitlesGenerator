@@ -14,6 +14,7 @@ def _get_db_override(row, *, for_create=False):
         mock_session = AsyncMock()
         mock_result = MagicMock()
         mock_result.scalar_one_or_none = MagicMock(return_value=row)
+        mock_result.first = MagicMock(return_value=None)  # no active dup (WS5)
         mock_session.execute = AsyncMock(return_value=mock_result)
         if for_create:
             mock_session.add = MagicMock()
@@ -605,6 +606,7 @@ async def test_jellyfin_refresh_happy_path(client, make_settings_row):
         mock_session = AsyncMock()
         mock_result = MagicMock()
         mock_result.scalar_one_or_none = MagicMock(return_value=settings)
+        mock_result.first = MagicMock(return_value=None)  # no active dup (WS5)
         mock_session.execute = AsyncMock(return_value=mock_result)
         mock_session.get = AsyncMock(return_value=settings)
         mock_session.commit = AsyncMock()
@@ -651,3 +653,69 @@ async def test_reverify_404_when_job_missing(client):
         mock_get.return_value = None
         response = await client.post("/api/v1/jobs/nope/verify")
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/jobs/{id}/regenerate — Task 2
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_regenerate_dispatches_and_announces(client):
+    app.dependency_overrides[get_db] = _empty_db
+    new_job = _make_job(file_path="/mnt/nas/film.mkv", status="queued")
+    with patch("app.api.jobs.job_service.regenerate_job", new_callable=AsyncMock) as mock_regen, \
+         patch("app.api.jobs.generate_subtitles") as mock_task, \
+         patch("app.api.jobs._announce_created", new_callable=AsyncMock) as mock_ann:
+        mock_regen.return_value = new_job
+        response = await client.post("/api/v1/jobs/src/regenerate")
+    assert response.status_code == 202
+    mock_task.delay.assert_called_once_with(new_job.id)
+    mock_ann.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,expected", [
+    ("JOB_NOT_FOUND", 404), ("JOB_NOT_TERMINAL", 400), ("ALREADY_ACTIVE", 409),
+])
+async def test_regenerate_error_mapping(client, code, expected):
+    app.dependency_overrides[get_db] = _empty_db
+    from app.services import job_service
+    with patch("app.api.jobs.job_service.regenerate_job", new_callable=AsyncMock) as mock_regen:
+        mock_regen.side_effect = job_service.RegenerateError(code, "boom")
+        response = await client.post("/api/v1/jobs/src/regenerate")
+    assert response.status_code == expected
+    assert response.json()["code"] == code
+
+
+@pytest.mark.asyncio
+async def test_post_jobs_duplicate_returns_409(client, make_settings_row):
+    """WS5: double-submitting the same file answers 409, not a second job."""
+    settings = make_settings_row(
+        nas_mount_path="/mnt/nas",
+        transcription_api_url="http://whisper:8000",
+        profiles=[{"name": "P1", "transcription_backend": "remote-api"}],
+    )
+
+    async def _override():
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none = MagicMock(return_value=settings)
+        mock_result.first = MagicMock(return_value=("existing-job-id",))  # active dup
+        mock_session.execute = AsyncMock(return_value=mock_result)
+        mock_session.add = MagicMock()
+        mock_session.commit = AsyncMock()
+        mock_session.refresh = AsyncMock()
+        yield mock_session
+
+    app.dependency_overrides[get_db] = _override
+    try:
+        resp = await client.post("/api/v1/jobs", json={
+            "file_path": "/mnt/nas/movies/Film.mkv",
+            "profile_name": "P1",
+            "source_language": "auto",
+            "translate": False,
+        })
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "JOB_ALREADY_ACTIVE"

@@ -65,6 +65,14 @@ Then open **Library**, pick a video, and hit **Submit**. The subtitle file appea
 
 ---
 
+## Reviewing & re-running results
+
+Every finished job gets a plain-language quality verdict — **Looks good**, **Worth a look**, or **Needs attention** — shown on its detail page and in **History**. Any issues are explained in everyday terms (e.g. "some lines may be fast to read") with a suggested fix; the raw technical checks sit behind a "See all details" toggle. It never blocks output — it's a heads-up.
+
+If a result needs redoing, click **Regenerate** on its **History** row: it re-runs that file with the *same settings the original job used*, in one click — no need to set it up again. (If a job for that file is already running, it tells you instead of starting a duplicate.)
+
+---
+
 ## Updating
 
 ```bash
@@ -88,6 +96,36 @@ For anything else, open an issue: <https://github.com/radekderkacz/SubtitlesGene
 ---
 
 ## Advanced &amp; reference
+
+<details>
+<summary><b>Quality pipeline &amp; tuning flags (July 2026)</b></summary>
+
+Every job now runs a quality pipeline modeled on professional subtitle standards:
+
+- **Speech detection (VAD)** — the worker detects speech regions locally and rejects
+  transcription segments that sit over silence/music (Whisper's classic
+  "Thanks for watching!" hallucinations). Disable with `SUBGEN_DISABLE_VAD=1`.
+- **Dialogue-track selection** — the audio stream is picked explicitly (your
+  source-language tag wins, then the container default), so a 5.1 commentary or
+  foreign dub can no longer be transcribed by accident. For surround sources,
+  `SUBGEN_CENTER_CHANNEL=1` additionally isolates the center (dialogue) channel.
+- **Timing guarantees** — cues never flash (&lt;0.83s), never overlap, wrap to at most
+  two 42-character lines, and split at clause boundaries. `SUBGEN_SHOT_SNAP=1`
+  additionally aligns cue boundaries to picture cuts (costs one video decode per job).
+- **Context-aware translation** — scene-shaped batches, a per-film "bible"
+  (character genders, pinned term translations, setting/register), a rolling story
+  summary, output validation with corrective re-asks, and a bounded repair pass.
+- **Resume, not restart** — transcription and per-batch translation results are
+  checkpointed per job; a transient failure resumes where it stopped.
+- **Verification & scorecard** — every finished job gets structural/heuristic/semantic
+  checks (including output-language ID and an audio↔subtitle sync measurement) plus a
+  quality scorecard (reading speed, coverage, cue stats) on the job detail page.
+
+**Bazarr integration:** point Bazarr's *whisper* provider at this app's URL —
+`POST /asr` and `POST /detect-language` speak the whisper-asr-webservice protocol and
+run the full cue pipeline using your default AI profile (`?profile=NAME` to override).
+
+</details>
 
 <details>
 <summary><b>How it works (architecture)</b></summary>
@@ -155,6 +193,7 @@ The OpenAPI docs are at `/docs` once the app is running.
 <summary><b>Operational notes</b></summary>
 
 - **The worker child respawns after every task** (`worker_max_tasks_per_child=1`). Intentional — long pipeline tasks accumulate per-process state (file handles, HTTP pools, ffmpeg remnants). Fork cost is sub-second on the slim worker image; transcription runs for minutes, so the overhead is invisible. See [`backend/app/worker/celery_app.py`](backend/app/worker/celery_app.py).
+- **Long movies are first-class.** Translation is sent to the model in small batches (with an automatic per-cue fallback if a batch comes back misaligned, so no line is ever dropped), and a job survives multi-hour runs without restarting (the broker visibility timeout is set well beyond any job). Expect a feature-length film to take tens of minutes, dominated by your transcription + translation hardware.
 - **Subtitles are written sibling to the source video** as `<basename>.<lang>.srt` (e.g. `MyMovie.pl.srt`) — the convention Jellyfin and Plex auto-detect.
 - **On every completed job the worker POSTs to Jellyfin's `/Library/Refresh`** if a Jellyfin URL is configured; the new track appears within seconds.
 - **The Automations workspace** (sidebar → Sparkles icon) lets you create:

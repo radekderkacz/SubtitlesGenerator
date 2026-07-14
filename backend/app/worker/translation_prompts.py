@@ -19,13 +19,16 @@ previous one-liner prompt.
 from __future__ import annotations
 
 
-UNIVERSAL_RULES = """You are translating a single subtitle cue from a film or TV show. Follow
+UNIVERSAL_RULES = """You are translating subtitle cues from a film or TV show. Follow
 these rules strictly:
 
-1. GRAMMAR FIRST. Output must be a grammatically complete, natural-sounding
-   sentence (or sentences) in the target language. Never drop required
-   articles, verbs, or sentence connectives to save space. A broken
-   sentence is worse than a slightly long one.
+1. GRAMMAR FIRST. Output must be natural-sounding target-language text.
+   When a cue is a complete sentence, produce a grammatically complete
+   sentence; when it is a fragment of a sentence that continues in the
+   next cue, produce the matching fragment so the sentence flows across
+   cues — do NOT force each fragment into a standalone sentence. Never
+   drop required articles, verbs, or sentence connectives to save space.
+   A broken sentence is worse than a slightly long one.
 
 2. PRESERVE PROPER NOUNS. Character names, nicknames, place names, brand
    names, fictional species, alien terms, and made-up words stay in their
@@ -53,7 +56,18 @@ these rules strictly:
    translated lines are provided when available — honour them.
 
 7. WHEN UNSURE, KEEP THE SOURCE WORD. Better an English term than an
-   invented or wrong translation."""
+   invented or wrong translation.
+
+8. DIALOGUE AND MARKUP. When a cue contains two speakers, keep one line
+   per speaker, each starting with the dialogue dash. Keep ♪ markers and
+   [bracketed sound labels] in place — translate the words inside them,
+   never remove or relocate the markers.
+
+9. THE SOURCE IS SPEECH-RECOGNITION OUTPUT. It may contain mishearings
+   and missing punctuation. Translate the evidently intended meaning; if
+   a garbled word closely matches a GLOSSARY entry, use the glossary
+   spelling. Never invent content to "fix" an unclear line — prefer a
+   literal rendering."""
 
 
 # Per-language overlays. Each is short on purpose — the universal rules
@@ -149,14 +163,83 @@ LANGUAGE_OVERLAYS: dict[str, str] = {
 
 
 # Number of (source, target) pairs from earlier in the film to include
-# as continuity context on each per-segment call. 3 pairs is enough to
-# pin character names + register without bloating the prompt.
-CONTEXT_WINDOW_SIZE = 1
+# as continuity context on each call. Was dropped to 1 when translation
+# ran per-cue (context tripled per-call latency on local models); batching
+# amortizes the prompt across 10 cues, so 3 pairs of cross-batch context
+# costs ~90 extra tokens per ~10-cue call — cheap for the gender/register
+# continuity it buys (Polish gendered past tense, tu/vous tracking).
+CONTEXT_WINDOW_SIZE = 3
+
+# ISO-639-1 → English language name. Weaker models follow "translate to
+# Polish" far more reliably than "translate to pl"; the names also label
+# continuity pairs with the real source language (a Japanese film's lines
+# used to be labelled "EN:").
+LANGUAGE_NAMES: dict[str, str] = {
+    "en": "English", "pl": "Polish", "de": "German", "es": "Spanish",
+    "fr": "French", "it": "Italian", "pt": "Portuguese", "ru": "Russian",
+    "ja": "Japanese", "zh": "Chinese", "ko": "Korean", "nl": "Dutch",
+    "cs": "Czech", "uk": "Ukrainian", "ar": "Arabic", "hi": "Hindi",
+    "tr": "Turkish", "sv": "Swedish", "no": "Norwegian", "da": "Danish",
+    "fi": "Finnish", "el": "Greek", "hu": "Hungarian", "ro": "Romanian",
+    "vi": "Vietnamese", "th": "Thai", "he": "Hebrew", "id": "Indonesian",
+    "sk": "Slovak", "bg": "Bulgarian", "hr": "Croatian", "sr": "Serbian",
+    "ca": "Catalan",
+}
+
+
+def language_name(code: str | None) -> str:
+    """Human-readable name for an ISO-639-1 code; unknown codes pass through."""
+    cleaned = (code or "").strip()
+    return LANGUAGE_NAMES.get(cleaned.lower(), cleaned)
+
+
+def _context_block(
+    context_pairs: list[tuple[str, str]],
+    target_language: str,
+    source_language: str | None,
+) -> list[str]:
+    """Render continuity pairs with real language-name labels."""
+    src_label = (language_name(source_language).upper() or "SOURCE") if source_language else "SOURCE"
+    tgt_label = language_name(target_language).upper() or target_language.upper()
+    lines = ["Previous lines from this film for continuity reference:"]
+    for src, tgt in context_pairs:
+        lines.append(f"  {src_label}: {src}")
+        lines.append(f"  {tgt_label}: {tgt}")
+    lines.append("")
+    return lines
+
+
+def _bible_block(bible: dict) -> str:
+    """Render the film bible (characters + genders, setting, register, pinned
+    term translations) for the system prompt. Character genders directly
+    attack gendered-verb errors (Polish/Russian past tense); pinned terms give
+    cue 847 the same translation cue 12 chose."""
+    lines: list[str] = ["FILM CONTEXT:"]
+    setting = (bible.get("setting") or "").strip()
+    if setting:
+        lines.append(f"- Setting: {setting}")
+    register = (bible.get("register") or "").strip()
+    if register:
+        lines.append(f"- Dialogue register: {register}")
+    characters = [c for c in (bible.get("characters") or [])
+                  if isinstance(c, dict) and c.get("name")]
+    if characters:
+        rendered = ", ".join(
+            f"{c['name']} ({c['gender']})" if c.get("gender") else str(c["name"])
+            for c in characters
+        )
+        lines.append(f"- Characters (use these genders for gendered grammar): {rendered}")
+    terms = bible.get("terms") or {}
+    if terms:
+        pinned = "; ".join(f"{src} → {tgt}" for src, tgt in terms.items())
+        lines.append(f"- ESTABLISHED TRANSLATIONS (always use these): {pinned}")
+    return "\n".join(lines)
 
 
 def build_system_prompt(
     target_language: str | None,
     glossary: list[str] | None = None,
+    bible: dict | None = None,
 ) -> str:
     """Compose the system message: universal rules + language overlay +
     optional glossary.
@@ -177,6 +260,10 @@ def build_system_prompt(
     parts = [UNIVERSAL_RULES]
     if overlay:
         parts.append(overlay)
+    if bible:
+        block = _bible_block(bible)
+        if block != "FILM CONTEXT:":
+            parts.append(block)
     if glossary:
         glossary_block = (
             "GLOSSARY — the following words / names appear in this film and "
@@ -216,10 +303,38 @@ def build_glossary_extraction_prompt(joined_source: str) -> tuple[str, str]:
     return system, user
 
 
+def build_bible_extraction_prompt(chunk: str, target_language: str) -> tuple[str, str]:
+    """(system, user) for one film-bible extraction call over a transcript
+    window. Output contract: a single JSON object, nothing else."""
+    system = (
+        "You analyze film subtitle transcripts so a translator can stay "
+        "consistent. Return ONLY a raw JSON object — no commentary, no "
+        "markdown fences."
+    )
+    user = (
+        "From this transcript excerpt, extract:\n"
+        '- "names": proper nouns to keep verbatim (characters, places, '
+        "brands, fictional terms)\n"
+        '- "characters": [{"name": ..., "gender": "male"|"female"|"unknown"}] '
+        "for every speaking character whose gender is evident\n"
+        '- "terms": {source term: %s translation} for recurring translatable '
+        "terms (titles, nicknames, jargon) that must stay consistent\n"
+        '- "setting": one sentence describing the story world\n'
+        '- "register": a short description of the dialogue register '
+        "(formal/informal, era, profession)\n\n"
+        "Output format: "
+        '{"names": [...], "characters": [...], "terms": {...}, '
+        '"setting": "...", "register": "..."}\n\n'
+        "Transcript:\n%s"
+    ) % (language_name(target_language), chunk)
+    return system, user
+
+
 def build_user_prompt(
     text: str,
     target_language: str,
     context_pairs: list[tuple[str, str]] | None = None,
+    source_language: str | None = None,
 ) -> str:
     """Compose the user message: prior translated pairs (if any) + the
     current line to translate.
@@ -230,16 +345,66 @@ def build_user_prompt(
     """
     lines: list[str] = []
     if context_pairs:
-        lines.append("Previous lines from this film for continuity reference:")
-        for src, tgt in context_pairs:
-            lines.append(f"  EN: {src}")
-            lines.append(f"  {target_language.upper()}: {tgt}")
-        lines.append("")  # blank line before the actual ask
+        lines.extend(_context_block(context_pairs, target_language, source_language))
     lines.append(
-        f"Translate the next line to {target_language}. "
+        f"Translate the next line to {language_name(target_language)}. "
         f"Output only the translated line, with no commentary, no quotes, "
         f"and no preamble."
     )
     lines.append("")
     lines.append(text)
+    return "\n".join(lines)
+
+
+BATCH_OUTPUT_CONTRACT = (
+    "You are now translating a NUMBERED LIST of consecutive subtitle cues from "
+    "the same film, in original order — not a single line. USE CROSS-CUE "
+    "CONTEXT: resolve pronouns, grammatical gender, and formality (ty/Pan, "
+    "du/Sie, tu/vous) from the surrounding cues and the continuity lines when "
+    "present; when a sentence continues across cues, translate it as one "
+    "flowing sentence split at the same point. Output each translation on "
+    "its own line, prefixed with the SAME number and a period (e.g. '1.', '2.'), in "
+    "the same order, exactly one line per input cue, and nothing else — no "
+    "commentary, no blank lines, no quotes, no reasoning."
+)
+
+
+def build_batch_system_prompt(
+    target_language: str,
+    glossary: list[str] | None = None,
+    bible: dict | None = None,
+) -> str:
+    """Per-cue system prompt (rules + per-language overlay + film bible +
+    glossary) plus a numbered-list output contract, so one call can translate
+    many cues."""
+    return (build_system_prompt(target_language, glossary=glossary, bible=bible)
+            + "\n\n" + BATCH_OUTPUT_CONTRACT)
+
+
+def build_batch_user_prompt(
+    texts: list[str],
+    target_language: str,
+    context_pairs: list[tuple[str, str]] | None = None,
+    source_language: str | None = None,
+    story_so_far: str | None = None,
+) -> str:
+    """Compose the batch user message: optional story summary + continuity
+    context, then the numbered source cues (each flattened to one line —
+    reflow re-wraps later)."""
+    lines: list[str] = []
+    if story_so_far:
+        lines.append(f"STORY SO FAR (for pronoun/gender/register continuity): {story_so_far}")
+        lines.append("")
+    if context_pairs:
+        lines.extend(_context_block(context_pairs, target_language, source_language))
+    lines.append(
+        f"Translate the following {len(texts)} numbered lines to "
+        f"{language_name(target_language)}. "
+        f"Output each translation on its own line prefixed with its number "
+        f"(1., 2., …), same order, one per input line, nothing else."
+    )
+    lines.append("")
+    for n, t in enumerate(texts, start=1):
+        flat = " ".join(t.splitlines()).strip()
+        lines.append(f"{n}. {flat}")
     return "\n".join(lines)

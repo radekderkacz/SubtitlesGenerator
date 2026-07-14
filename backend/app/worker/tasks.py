@@ -2,6 +2,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import time
 from datetime import datetime, timezone
 
@@ -12,6 +13,11 @@ import redis.asyncio as aioredis
 from app.core.config import app_settings
 from app.models.orm import Job, Settings, _utcnow
 from app.models.schemas import JobStatus, JobPhase
+from app.worker.asr_filters import filter_segments, normalize_lang_code
+from app.worker.audio import audio_filter_for, pick_audio_stream
+from app.worker.langid import batch_language_suspect, language_check
+from app.worker.shot_snap import detect_shot_changes, shot_snap_enabled, snap_cues_to_shots
+from app.worker.vad import detect_speech_regions, save_regions, vad_disabled
 from app.worker.celery_app import celery_app
 from app.worker.cue_timing import (
     extract_words,
@@ -78,6 +84,131 @@ async def _update_job(job_id: str, **fields) -> Job:
         return job
 
 
+class _JobCancelled(Exception):
+    """Raised inside long phases when the job row flips to cancelled, so the
+    pipeline can stop paying for work nobody wants (2026-07 audit)."""
+
+
+async def _complete_job_if_processing(job_id: str, **fields) -> Job | None:
+    """Compare-and-set terminal write: apply ``fields`` only while the job is
+    still ``processing``. Returns the refreshed Job, or None when the update
+    lost the race (e.g. a cancel landed between the last phase and here)."""
+    from sqlalchemy import update as sa_update
+
+    from app.core.database import AsyncSessionLocal
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            sa_update(Job)
+            .where(Job.id == job_id, Job.status == JobStatus.processing)
+            .values(updated_at=_utcnow(), **fields)
+        )
+        await session.commit()
+        if result.rowcount == 0:
+            return None
+        return await session.get(Job, job_id)
+
+
+def _checkpoint_path(job_id: str) -> str:
+    return f"{_LOG_DIR}/{job_id}.transcription.json"
+
+
+def _translation_progress_path(job_id: str) -> str:
+    return f"{_LOG_DIR}/{job_id}.translation.json"
+
+
+def _load_translation_progress(job_id: str) -> dict[str, str]:
+    """Per-cue translated texts from a previous attempt, keyed by segment
+    index (as str). Empty dict when absent/unreadable."""
+    try:
+        with open(_translation_progress_path(job_id), encoding="utf-8") as f:
+            data = json.load(f)
+        texts = data.get("texts")
+        return texts if isinstance(texts, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _save_translation_progress(job_id: str, texts: dict[str, str]) -> None:
+    try:
+        with open(_translation_progress_path(job_id), "w", encoding="utf-8") as f:
+            json.dump({"texts": texts}, f)
+    except OSError:
+        pass
+
+
+def _restore_saved_batch(saved: dict[str, str], idxs: range, chunk: list[dict]) -> bool:
+    """When every cue of this batch was translated in a previous attempt,
+    restore the texts and skip the LLM. Returns True when restored."""
+    if not saved or not all(str(i) in saved for i in idxs):
+        return False
+    for i, seg in zip(idxs, chunk):
+        seg["text"] = saved[str(i)]
+    return True
+
+
+def _save_transcription_checkpoint(job_id: str, result: dict) -> None:
+    """Persist the (filtered) transcription so a job-level retry resumes at
+    translation instead of re-running 20-40 min of GPU inference (2026-07
+    audit HIGH-1). Best-effort: a write failure just means no resume."""
+    try:
+        with open(_checkpoint_path(job_id), "w", encoding="utf-8") as f:
+            json.dump(result, f)
+    except OSError:
+        pass
+
+
+def _load_transcription_checkpoint(job_id: str) -> dict | None:
+    try:
+        with open(_checkpoint_path(job_id), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) and data.get("segments") else None
+
+
+def _clear_job_artifacts(job_id: str) -> None:
+    """Drop resume artifacts on terminal states (the .vad.json stays — the
+    post-completion sync check reads it)."""
+    for path in (_checkpoint_path(job_id), _translation_progress_path(job_id)):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+class _job_heartbeat:
+    """Async context manager bumping the job's updated_at periodically while a
+    long blocking call runs, so orphan recovery can tell "alive but silent"
+    (a 30-min transcription POST) from "worker died"."""
+
+    def __init__(self, job_id: str, interval: float = 60.0) -> None:
+        self._job_id = job_id
+        self._interval = interval
+        self._task: asyncio.Task | None = None
+
+    async def _beat(self) -> None:
+        while True:
+            await asyncio.sleep(self._interval)
+            try:
+                await _update_job(self._job_id)
+            # heartbeat must never kill the job
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def __aenter__(self) -> "_job_heartbeat":
+        self._task = asyncio.create_task(self._beat())
+        return self
+
+    async def __aexit__(self, *exc_info) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            # awaiting a task WE just cancelled; suppress() keeps the intent
+            # explicit without an except block that swallows a foreign cancel
+            import contextlib
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+
+
 def _set_job_failed_sync(job_id: str, message: str) -> None:
     """Fresh asyncio.run (NullPool-safe) to mark a job failed from the
     sync Celery context after retries are exhausted."""
@@ -88,6 +219,32 @@ def _set_job_failed_sync(job_id: str, message: str) -> None:
 
 async def _publish_event(redis_client: aioredis.Redis, job: Job) -> None:
     await redis_client.publish(_REDIS_CHANNEL, json.dumps(build_job_event_payload(job)))
+
+
+async def _select_dialogue_stream(
+    loop, ffmpeg, path: str, job: Job, job_id: str, log_path: str
+) -> tuple[dict | None, int | None]:
+    """Pick the dialogue track explicitly — ffmpeg's default selects the
+    most-channels stream, which on a typical MKV is a 5.1 commentary or a
+    foreign dub (2026-07 audit). Probe failures fall back to the default."""
+    try:
+        probe_data = await loop.run_in_executor(None, ffmpeg.probe, path)
+    # best-effort; default selection remains
+    except Exception:  # noqa: BLE001
+        _write_log(log_path, "WARNING", job_id,
+                   "ffprobe failed — using ffmpeg default stream selection")
+        return None, None
+    if not isinstance(probe_data, dict):
+        return None, None
+    raw_hint = (job.source_language or "").strip().lower()
+    hint = None if raw_hint in ("", "auto") else raw_hint
+    stream, rel = pick_audio_stream(probe_data, hint)
+    if stream is not None:
+        lang = ((stream.get("tags") or {}).get("language")) or "und"
+        _write_log(log_path, "INFO", job_id,
+                   f"Selected audio stream a:{rel} "
+                   f"(lang={lang}, {stream.get('channels')}ch)")
+    return stream, rel
 
 
 async def _extract_audio(
@@ -108,17 +265,22 @@ async def _extract_audio(
     await _publish_event(redis_client, job)
 
     loop = asyncio.get_running_loop()
+    stream, rel = await _select_dialogue_stream(
+        loop, ffmpeg, str(validated_path), job, job_id, log_path)
+
+    def _run_extraction():
+        inp = ffmpeg.input(str(validated_path))
+        src = inp[f"a:{rel}"] if rel is not None else inp
+        kwargs = {"acodec": "pcm_s16le", "ac": 1, "ar": "16000"}
+        pan = audio_filter_for(stream)
+        if pan:
+            kwargs["af"] = pan
+        (ffmpeg.output(src, audio_path, **kwargs)
+         .overwrite_output()
+         .run(capture_stdout=True, capture_stderr=True))
+
     try:
-        await loop.run_in_executor(
-            None,
-            lambda: (
-                ffmpeg
-                .input(str(validated_path))
-                .output(audio_path, acodec="pcm_s16le", ac=1, ar="16000")
-                .overwrite_output()
-                .run(capture_stdout=True, capture_stderr=True)
-            ),
-        )
+        await loop.run_in_executor(None, _run_extraction)
     except ffmpeg.Error as e:
         stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else "unknown ffmpeg error"
         raise RuntimeError(f"ffmpeg failed: {stderr}")
@@ -222,7 +384,8 @@ def _raise_transcription_http_error(e: "httpx.HTTPStatusError") -> None:
 
 
 def _run_transcription_remote_blocking(
-    audio_path: str, url: str, model: str, api_key: str | None
+    audio_path: str, url: str, model: str, api_key: str | None,
+    *, language_hint: str | None = None,
 ) -> dict:
     """POST the extracted audio to an OpenAI-compatible /v1/audio/transcriptions
     endpoint (faster-whisper-server, speaches, etc.) and return ``{language,
@@ -258,6 +421,10 @@ def _run_transcription_remote_blocking(
                     "response_format": "verbose_json",
                     "timestamp_granularities[]": ["segment", "word"],
                 }
+                if language_hint:
+                    # The user's source-language hint stops Whisper from
+                    # misdetecting on music/foreign-quote openings.
+                    data["language"] = language_hint
                 with httpx.Client(timeout=httpx.Timeout(3600.0, connect=30.0)) as client:
                     resp = client.post(endpoint, headers=headers, files=files, data=data)
                     try:
@@ -273,18 +440,62 @@ def _run_transcription_remote_blocking(
         except OSError:
             pass
 
-    language = body.get("language")
-    segments_raw = body.get("segments") or []
-    segments = [
-        {"start": s.get("start"), "end": s.get("end"), "text": (s.get("text") or "").strip()}
-        for s in segments_raw
-        if s.get("start") is not None and s.get("end") is not None
+    return {
+        "language": body.get("language"),
+        "segments": _reduce_response_segments(body.get("segments") or []),
+        "words": extract_words(body),
+    }
+
+
+def _reduce_response_segments(segments_raw: list) -> list[dict]:
+    """Reduce provider segments to the pipeline shape, keeping the confidence
+    fields that feed the hallucination filters downstream
+    (asr_filters.filter_segments); absent on some backends."""
+    segments: list[dict] = []
+    for s in segments_raw:
+        if s.get("start") is None or s.get("end") is None:
+            continue
+        seg = {"start": s.get("start"), "end": s.get("end"), "text": (s.get("text") or "").strip()}
+        for key in ("no_speech_prob", "avg_logprob", "compression_ratio"):
+            if s.get(key) is not None:
+                seg[key] = s[key]
+        segments.append(seg)
+    return segments
+
+
+def _postprocess_transcription(
+    result: dict,
+    user_hint: str | None,
+    speech_regions: list[tuple[float, float]] | None = None,
+) -> tuple[dict, list[dict], str]:
+    """Filter hallucinations out of a transcription and resolve the stored
+    language (user hint wins over detection; both normalized to ISO-639-1).
+    Words inside dropped segment ranges are removed so the word timing path
+    can't resurrect filtered text. Raises when no speech survives."""
+    filtered = filter_segments(result.get("segments") or [],
+                               speech_regions=speech_regions)
+    if not filtered.segments:
+        raise RuntimeError(
+            "No speech detected in the audio — no subtitles were generated"
+        )
+    out = dict(result, segments=filtered.segments)
+    dropped_ranges = [
+        (d.get("start"), d.get("end")) for d in filtered.dropped
+        if d.get("start") is not None and d.get("end") is not None
     ]
-    return {"language": language, "segments": segments, "words": extract_words(body)}
+    words = out.get("words") or []
+    if words and dropped_ranges:
+        out["words"] = [
+            w for w in words
+            if not any(s <= w["start"] < e for s, e in dropped_ranges)
+        ]
+    language = user_hint or normalize_lang_code(out.get("language"))
+    return out, filtered.dropped, language
 
 
 async def _transcribe(
-    job: Job, job_id: str, audio_path: str, log_path: str, redis_client: aioredis.Redis
+    job: Job, job_id: str, audio_path: str, log_path: str, redis_client: aioredis.Redis,
+    speech_regions: list[tuple[float, float]] | None = None,
 ) -> dict:
     """Transcription via an OpenAI-compatible /v1/audio/transcriptions endpoint.
 
@@ -309,27 +520,41 @@ async def _transcribe(
         f"Transcription started (remote: {url}, model: {model})",
     )
 
+    raw_hint = (job.source_language or "").strip().lower()
+    user_hint = normalize_lang_code(raw_hint) if raw_hint not in ("", "auto") else None
+
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(
-        None,
-        _run_transcription_remote_blocking,
-        audio_path,
-        url,
-        model,
-        b.get("transcription_api_key"),
-    )
-    language = result.get("language")
-    segments = result.get("segments")
-    if not language or segments is None:
+    async with _job_heartbeat(job_id):
+        result = await loop.run_in_executor(
+            None,
+            lambda: _run_transcription_remote_blocking(
+                audio_path, url, model, b.get("transcription_api_key"),
+                language_hint=user_hint,
+            ),
+        )
+    detected = result.get("language")
+    if not detected or result.get("segments") is None:
         raise RuntimeError(
             f"Remote transcription returned unexpected shape: keys={list(result.keys())}"
         )
+    result, dropped, language = _postprocess_transcription(
+        result, user_hint, speech_regions=speech_regions)
+    for d in dropped:
+        _write_log(log_path, "INFO", job_id,
+                   f"Filtered segment ({d['reason']}) at {d['start']}: {d['text'][:80]!r}")
+    if user_hint and normalize_lang_code(detected) != user_hint:
+        _write_log(log_path, "WARNING", job_id,
+                   f"Detected language {detected!r} differs from configured "
+                   f"{user_hint!r} — keeping the configured language")
+    segments = result["segments"]
     words = result.get("words") or []
+    result["language"] = language
     job = await _update_job(job_id, source_language=language, progress=60)
     _write_log(
         log_path, "INFO", job_id,
         f"Transcription complete — language: {language}, segments: {len(segments)}, "
-        f"words: {len(words)} ({'word-level' if words else 'segment-level heuristic'} timing)",
+        f"words: {len(words)}, filtered: {len(dropped)} "
+        f"({'word-level' if words else 'segment-level heuristic'} timing)",
     )
     await _publish_event(redis_client, job)
     # Return the full result so the pipeline can re-segment into speech-aligned
@@ -394,32 +619,45 @@ def _resolve_translation_endpoint(mapped_model: str, base_url: str | None) -> tu
     return actual_model, endpoint
 
 
+_TRANSLATION_BACKOFFS = [5.0, 15.0]
+
+
+def _strip_think(content: str) -> str:
+    """Remove chain-of-thought from reasoning-model replies. The ``/no_think``
+    prefix only works on the Qwen3 family; DeepSeek-R1 and friends emit
+    ``<think>…</think>`` regardless, and numbered lines inside the reasoning
+    would otherwise be parsed as translations."""
+    if "</think>" in content:
+        content = content.rsplit("</think>", 1)[1]
+    elif "<think>" in content:
+        # Unclosed think block (truncated reasoning) — nothing usable follows.
+        content = content.split("<think>", 1)[0]
+    return content.strip()
+
+
 def _post_translation_with_retries(
     endpoint: str, headers: dict[str, str], body: dict
 ) -> tuple[str, dict]:
-    """POST the translation request with up to 3 attempts. Returns
-    ``(stripped_content, raw_response_dict)`` where the dict is the full
-    parsed JSON (so upstream ``app.worker.usage.extract_usage`` can read
-    both ``data["usage"]`` and the Ollama top-level eval-count fallback)."""
-    last_err: Exception | None = None
-    for attempt in range(3):
-        try:
-            with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
-                resp = client.post(endpoint, headers=headers, json=body)
-                resp.raise_for_status()
-                data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            if content is None:
-                raise RuntimeError("Empty response from translation model")
-            return content.strip(), (data if isinstance(data, dict) else {})
-        except Exception as e:
-            last_err = e
-            if attempt >= 2:
-                break
-    from app.worker.errors import TransientPipelineError, is_transient
-    if last_err is not None and is_transient(last_err):
-        raise TransientPipelineError("translation", last_err) from last_err
-    raise RuntimeError(f"Translation request failed after 3 attempts: {last_err}")
+    """POST the translation request. Transient failures (5xx/429/timeouts)
+    back off between attempts and surface as TransientPipelineError when
+    exhausted; terminal ones (401/400/…) fail fast on the first try instead
+    of being hammered. Returns ``(content_without_think_tags,
+    raw_response_dict)`` — the dict is the full parsed JSON so
+    ``app.worker.usage.extract_usage`` can read usage/cost fields."""
+    from app.worker.errors import retry_call
+
+    def _do() -> tuple[str, dict]:
+        with httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+            resp = client.post(endpoint, headers=headers, json=body)
+            resp.raise_for_status()
+            data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        content = _strip_think(content) if content is not None else ""
+        if not content:
+            raise RuntimeError("Empty response from translation model")
+        return content, (data if isinstance(data, dict) else {})
+
+    return retry_call(_do, step="translation", backoffs=_TRANSLATION_BACKOFFS)
 
 
 def _parse_glossary_response(raw: str) -> list[str]:
@@ -461,6 +699,14 @@ def _parse_glossary_response(raw: str) -> list[str]:
     return out
 
 
+def _translation_headers(api_key: str | None) -> dict[str, str]:
+    """JSON headers for an OpenAI-compatible translation POST, with optional bearer auth."""
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 def _extract_glossary_blocking(
     joined_source: str,
     mapped_model: str,
@@ -476,9 +722,7 @@ def _extract_glossary_blocking(
     from app.worker.translation_prompts import build_glossary_extraction_prompt
 
     actual_model, endpoint = _resolve_translation_endpoint(mapped_model, base_url)
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    headers = _translation_headers(api_key)
 
     system, user = build_glossary_extraction_prompt(joined_source)
     body = {
@@ -487,6 +731,7 @@ def _extract_glossary_blocking(
             {"role": "system", "content": system},
             {"role": "user", "content": f"/no_think {user}"},
         ],
+        "temperature": TRANSLATION_TEMPERATURE,
     }
     try:
         raw, data = _post_translation_with_retries(endpoint, headers, body)
@@ -503,6 +748,9 @@ def _translate_segment_blocking(
     target_language: str,
     context_pairs: list[tuple[str, str]] | None = None,
     glossary: list[str] | None = None,
+    source_language: str | None = None,
+    prior_reply: str | None = None,
+    bible: dict | None = None,
 ) -> tuple[str, dict]:
     """Translate one subtitle segment via a direct OpenAI-compatible chat
     completions POST. Returns ``(translated_text, raw_response_dict)``.
@@ -526,24 +774,138 @@ def _translate_segment_blocking(
 
     actual_model, endpoint = _resolve_translation_endpoint(mapped_model, base_url)
 
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    headers = _translation_headers(api_key)
 
-    system_prompt = build_system_prompt(target_language, glossary=glossary)
+    system_prompt = build_system_prompt(target_language, glossary=glossary, bible=bible)
     # ``/no_think`` suppresses chain-of-thought tokens on reasoning models
-    # (qwen3.x, deepseek-r1, etc.). Non-reasoning models ignore it silently.
-    user_prompt = f"/no_think {build_user_prompt(text, target_language, context_pairs)}"
+    # (qwen3.x, deepseek-r1, etc.). Non-reasoning models ignore it silently;
+    # _strip_think handles models that emit <think> blocks regardless.
+    user_prompt = (
+        f"/no_think "
+        f"{build_user_prompt(text, target_language, context_pairs, source_language=source_language)}"
+    )
 
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    if prior_reply is not None:
+        messages.append({"role": "assistant", "content": prior_reply})
+        messages.append({"role": "user", "content": (
+            "That reply was not a valid translation (it was empty, a refusal, "
+            "or commentary). Reply with ONLY the translated line."
+        )})
     body = {
         "model": actual_model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        "messages": messages,
+        "temperature": TRANSLATION_TEMPERATURE,
+        # A runaway reasoning model must not burn minutes on one cue.
+        "max_tokens": max(128, min(1024, 2 * len(text))),
     }
 
     return _post_translation_with_retries(endpoint, headers, body)
+
+
+TRANSLATE_BATCH_SIZE = 10
+# Glossary extraction window: ~6k chars ≈ 2k tokens keeps each call inside
+# stock Ollama context limits (the OpenAI-compat endpoint can't set num_ctx,
+# so an oversized prompt silently truncates — names from the last two acts
+# of a film never made the glossary). Long films are sampled evenly.
+GLOSSARY_CHUNK_CHARS = 6000
+GLOSSARY_MAX_CHUNKS = 8
+# Low, fixed sampling temperature for translation — faithful MT wants
+# near-deterministic output. Default (~0.8) caused run-to-run quality
+# variance that the verification judge flagged as "wording reads poorly".
+TRANSLATION_TEMPERATURE = 0.2
+
+
+def _parse_numbered_line(line: str) -> tuple[int, str] | None:
+    """Parse a 'N. text' / 'N) text' / 'N: text' line into (N, text), or None.
+    Hand-rolled (no regex) to keep it linear — no backtracking surface."""
+    s = line.strip()
+    i = 0
+    while i < len(s) and s[i].isdigit():
+        i += 1
+    if i == 0 or i >= len(s) or s[i] not in ".):":
+        return None
+    text = s[i + 1:].strip()
+    if not text:
+        return None
+    return int(s[:i]), text
+
+
+def _parse_batch_response(raw: str, n: int) -> list[str] | None:
+    """Parse a numbered translation reply into a list aligned to the N inputs,
+    or None if it doesn't contain exactly numbers 1..N with non-empty text."""
+    found: dict[int, str] = {}
+    for line in raw.splitlines():
+        parsed = _parse_numbered_line(line)
+        if parsed is None:
+            continue
+        idx, text = parsed
+        if idx in found:
+            # A duplicated number means the model renumbered or leaked
+            # reasoning — trusting either occurrence risks mapping the wrong
+            # text to a cue. Treat the whole reply as misaligned.
+            return None
+        found[idx] = text
+    if len(found) != n or any(k not in found for k in range(1, n + 1)):
+        return None
+    return [found[k] for k in range(1, n + 1)]
+
+
+def _translate_batch_blocking(
+    texts: list[str],
+    mapped_model: str,
+    base_url: str | None,
+    api_key: str | None,
+    target_language: str,
+    context_pairs: list[tuple[str, str]] | None = None,
+    glossary: list[str] | None = None,
+    source_language: str | None = None,
+    prior_reply: str | None = None,
+    bible: dict | None = None,
+    story_so_far: str | None = None,
+) -> tuple[list[str] | None, str, dict]:
+    """One POST translating a batch of cues. Returns (aligned list | None,
+    raw_reply, raw_response_dict). None signals misalignment — including a
+    reply truncated by max_tokens — so the caller can corrective-re-ask or
+    fall back to per-cue. ``prior_reply`` turns the call into that corrective
+    re-ask: the bad reply is quoted as assistant context with an explicit
+    complaint."""
+    from app.worker.translation_prompts import build_batch_system_prompt, build_batch_user_prompt
+
+    actual_model, endpoint = _resolve_translation_endpoint(mapped_model, base_url)
+    headers = _translation_headers(api_key)
+    system_prompt = build_batch_system_prompt(target_language, glossary=glossary, bible=bible)
+    user_prompt = (
+        f"/no_think "
+        f"{build_batch_user_prompt(texts, target_language, context_pairs, source_language=source_language, story_so_far=story_so_far)}"
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    if prior_reply is not None:
+        messages.append({"role": "assistant", "content": prior_reply})
+        messages.append({"role": "user", "content": (
+            f"That reply did not contain exactly {len(texts)} numbered lines "
+            f"(1..{len(texts)}, one per input cue). Re-emit ALL {len(texts)} "
+            f"translations in that exact format and nothing else."
+        )})
+    body = {
+        "model": actual_model,
+        "messages": messages,
+        "temperature": TRANSLATION_TEMPERATURE,
+        # Sized to the batch so a runaway reasoning model can't stall the job.
+        "max_tokens": max(256, min(4096, sum(len(t) for t in texts) + 64 * len(texts))),
+    }
+    raw, data = _post_translation_with_retries(endpoint, headers, body)
+    finish = ((data.get("choices") or [{}])[0] or {}).get("finish_reason")
+    if finish == "length":
+        # Truncated list: the tail cues would be missing — never accept it.
+        return None, raw, data
+    return _parse_batch_response(raw, len(texts)), raw, data
 
 
 def _format_translation_error(provider: str, model: str, exc: Exception) -> str:
@@ -563,53 +925,343 @@ def _format_translation_error(provider: str, model: str, exc: Exception) -> str:
     return f"Translation failed ({provider} / {model}): {detail}"
 
 
+from dataclasses import dataclass, field
+
+
+@dataclass
+class _TranslateTarget:
+    """Everything a translation call needs to know about WHERE it is going
+    and WHAT film context it carries — one object instead of nine params."""
+    provider: str
+    model: str
+    mapped_model: str
+    base_url: str | None
+    api_key: str | None
+    target_language: str
+    source_language: str | None = None
+    glossary: list[str] | None = None
+    bible: dict | None = field(default=None, repr=False)
+
+
+_REFUSAL_PREFIXES = (
+    "i'm sorry", "i am sorry", "i cannot", "i can't", "i won't",
+    "as an ai", "as a language model", "here is", "here's",
+)
+
+
+def _clean_single_translation(original: str, translated: str) -> str | None:
+    """Validate a per-cue reply: strip wrapping quotes; reject empties,
+    refusal/preamble phrases, and implausible length blowups (>4×). Returns
+    the cleaned text or None when the reply must not be shipped."""
+    t = translated.strip()
+    for opener, closer in (('"', '"'), ("'", "'"), ("„", "”"), ("«", "»")):
+        if len(t) > 1 and t.startswith(opener) and t.endswith(closer):
+            t = t[1:-1].strip()
+    if not t:
+        return None
+    low = t.lower()
+    if any(low.startswith(p) for p in _REFUSAL_PREFIXES):
+        return None
+    if len(t) > 4 * max(len(original), 20):
+        return None
+    return t
+
+
 async def _translate_one_segment(
     loop,
     segment: dict,
+    tgt: _TranslateTarget,
     *,
-    provider: str,
-    model: str,
-    mapped_model: str,
-    base_url: str | None,
-    api_key: str | None,
-    target_language: str,
     context_pairs: list[tuple[str, str]] | None = None,
-    glossary: list[str] | None = None,
     acc: UsageAccumulator,
 ) -> None:
+    """Translate one cue with output validation: an invalid reply (refusal,
+    preamble, blowup) gets ONE corrective re-ask; if that also fails, the
+    source text is kept — an untranslated line beats shipped garbage, and
+    verification's language checks surface it."""
     from app.worker.errors import TransientPipelineError
 
     original = (segment.get("text") or "").strip()
     if not original:
         return
+    prior_reply: str | None = None
+    for _ in range(2):
+        try:
+            translated, data = await loop.run_in_executor(
+                None,
+                lambda prior=prior_reply: _translate_segment_blocking(
+                    original, tgt.mapped_model, tgt.base_url, tgt.api_key,
+                    tgt.target_language, context_pairs, tgt.glossary,
+                    source_language=tgt.source_language, prior_reply=prior,
+                    bible=tgt.bible,
+                ),
+            )
+        except TransientPipelineError:
+            # A transient translation outage (provider 5xx/timeout, in-call
+            # retries exhausted) MUST stay a TransientPipelineError so the
+            # pipeline chokepoint marks the job queued and the Celery entry
+            # self.retries it. The generic rewrapper below would downgrade it
+            # to a terminal RuntimeError and dead-end the translation requeue.
+            raise
+        except Exception as e:
+            # _format_translation_error owns the no-credential-leak rule; the
+            # original exception stays chained via `from e` for the logger.
+            raise RuntimeError(_format_translation_error(tgt.provider, tgt.model, e)) from e
+        acc.add(extract_usage(data))
+        cleaned = _clean_single_translation(original, translated)
+        if cleaned is not None:
+            segment["text"] = cleaned
+            return
+        prior_reply = translated
+    # Both attempts invalid: keep the source text (never ship a refusal) and
+    # flag the cue for the post-translation repair pass.
+    segment["needs_repair"] = True
+
+
+async def _translate_batch(
+    loop,
+    chunk: list[dict],
+    tgt: _TranslateTarget,
+    *,
+    context_pairs: list[tuple[str, str]] | None = None,
+    story_so_far: str | None = None,
+    acc: UsageAccumulator,
+) -> None:
+    """Translate a chunk in one call. A misaligned reply gets ONE corrective
+    re-ask (with the bad reply quoted) — most misalignments recover in that
+    single cheap call — before falling back to the per-cue path for each
+    non-empty cue. Empty cues are left untouched."""
+    from app.worker.errors import TransientPipelineError
+
+    nonempty = [s for s in chunk if (s.get("text") or "").strip()]
+    if not nonempty:
+        return
+    texts = [(s.get("text") or "").strip() for s in nonempty]
+    result: list[str] | None = None
+    prior_reply: str | None = None
+    for _ in range(2):
+        try:
+            result, raw, data = await loop.run_in_executor(
+                None,
+                lambda prior=prior_reply: _translate_batch_blocking(
+                    texts, tgt.mapped_model, tgt.base_url, tgt.api_key,
+                    tgt.target_language, context_pairs, tgt.glossary,
+                    source_language=tgt.source_language, prior_reply=prior,
+                    bible=tgt.bible, story_so_far=story_so_far,
+                ),
+            )
+        except TransientPipelineError:
+            raise
+        except Exception as e:
+            raise RuntimeError(_format_translation_error(tgt.provider, tgt.model, e)) from e
+        acc.add(extract_usage(data))
+        if _accept_batch_result(nonempty, result, tgt, first_attempt=prior_reply is None):
+            return
+        prior_reply = raw
+
+    for seg in nonempty:
+        await _translate_one_segment(loop, seg, tgt, context_pairs=context_pairs, acc=acc)
+
+
+def _accept_batch_result(
+    nonempty: list[dict], result: list[str] | None, tgt: _TranslateTarget,
+    *, first_attempt: bool,
+) -> bool:
+    """Apply an aligned batch reply unless (on the first attempt) it reads as
+    an untranslated source-language echo. Returns True when applied."""
+    if result is None:
+        return False
+    if first_attempt and batch_language_suspect(
+            result, tgt.target_language, tgt.source_language):
+        return False
+    for seg, translated in zip(nonempty, result):
+        seg["text"] = translated
+    return True
+
+
+# Scene-aware batching (2026-07 audit WS8): a silence gap between cues almost
+# always means a scene change, and translation context should not leak across
+# it. Batches cap at SCENE_BATCH_MAX_CUES so max_tokens stays predictable and
+# a single bad reply loses at most one scene's worth of work.
+SCENE_GAP_SECONDS = 4.0
+SCENE_BATCH_MAX_CUES = 15
+SCENE_BATCH_MIN_CUES = 5
+STORY_SUMMARY_EVERY_N_BATCHES = 5
+STORY_SUMMARY_MAX_CHARS = 400
+
+
+def batch_cues_by_scene(segments: list[dict]) -> list[list[dict]]:
+    """Group consecutive cues into scene-shaped translation batches: a new
+    batch starts at a silence gap (once the current batch has a useful
+    minimum) or at the size cap."""
+    batches: list[list[dict]] = []
+    cur: list[dict] = []
+    for seg in segments:
+        if cur:
+            gap = (seg.get("start") or 0.0) - (cur[-1].get("end") or 0.0)
+            scene_break = gap > SCENE_GAP_SECONDS and len(cur) >= SCENE_BATCH_MIN_CUES
+            if scene_break or len(cur) >= SCENE_BATCH_MAX_CUES:
+                batches.append(cur)
+                cur = []
+        cur.append(seg)
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def _parse_bible_response(raw: str) -> dict:
+    """Best-effort parser for the film-bible JSON object. Tolerates markdown
+    fences and surrounding prose; any failure returns {} (bible is a quality
+    boost, never a requirement)."""
+    import json as _json
+
+    cleaned = raw.replace("```json", "```").strip()
+    if "```" in cleaned:
+        parts = cleaned.split("```")
+        cleaned = max(parts, key=len)
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start == -1 or end <= start:
+        return {}
     try:
-        translated, data = await loop.run_in_executor(
-            None,
-            _translate_segment_blocking,
-            original,
-            mapped_model,
-            base_url,
-            api_key,
-            target_language,
-            context_pairs,
-            glossary,
-        )
-    except TransientPipelineError:
-        # A transient translation outage (provider 5xx/timeout, in-call
-        # retries exhausted) MUST stay a TransientPipelineError so the
-        # pipeline chokepoint marks the job queued and the Celery entry
-        # self.retries it. The generic rewrapper below would downgrade it
-        # to a terminal RuntimeError and dead-end the translation requeue.
-        raise
-    except Exception as e:
-        # _format_translation_error owns the no-credential-leak rule; the
-        # original exception stays chained via `from e` for the logger.
-        raise RuntimeError(_format_translation_error(provider, model, e)) from e
-    acc.add(extract_usage(data))
-    segment["text"] = translated
+        data = _json.loads(cleaned[start:end + 1])
+    except _json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict = {}
+    _parse_bible_lists(data, out)
+    terms = data.get("terms")
+    if isinstance(terms, dict):
+        out["terms"] = {str(k): str(v) for k, v in terms.items() if k and v}
+    for key in ("setting", "register"):
+        val = data.get(key)
+        if isinstance(val, str) and val.strip():
+            out[key] = val.strip()
+    return out
 
 
-async def _extract_and_log_glossary(
+def _parse_bible_lists(data: dict, out: dict) -> None:
+    names = data.get("names")
+    if isinstance(names, list):
+        out["names"] = [n.strip() for n in names if isinstance(n, str) and n.strip()]
+    chars = data.get("characters")
+    if isinstance(chars, list):
+        out["characters"] = [
+            {"name": c["name"].strip(), "gender": str(c.get("gender") or "unknown")}
+            for c in chars
+            if isinstance(c, dict) and isinstance(c.get("name"), str) and c["name"].strip()
+        ]
+
+
+def _merge_bible_names(b: dict, merged: dict, seen_names: set[str], chars: dict[str, str]) -> None:
+    for n in b.get("names") or []:
+        if n not in seen_names:
+            seen_names.add(n)
+            merged["names"].append(n)
+    for c in b.get("characters") or []:
+        prev = chars.get(c["name"])
+        if prev is None or (prev == "unknown" and c.get("gender") != "unknown"):
+            chars[c["name"]] = c.get("gender") or "unknown"
+
+
+def _merge_one_bible(b: dict, merged: dict, seen_names: set[str], chars: dict[str, str]) -> None:
+    _merge_bible_names(b, merged, seen_names, chars)
+    for src, tgt in (b.get("terms") or {}).items():
+        merged["terms"].setdefault(src, tgt)
+    for key in ("setting", "register"):
+        if not merged[key] and b.get(key):
+            merged[key] = b[key]
+
+
+def _merge_bibles(bibles: list[dict]) -> dict:
+    """Merge per-chunk bibles: ordered union for names/characters (first
+    gender wins unless it was 'unknown'), first-wins for terms and prose."""
+    merged: dict = {"names": [], "characters": [], "terms": {}, "setting": "", "register": ""}
+    seen_names: set[str] = set()
+    chars: dict[str, str] = {}
+    for b in bibles:
+        _merge_one_bible(b, merged, seen_names, chars)
+    merged["characters"] = [{"name": n, "gender": g} for n, g in chars.items()]
+    return merged
+
+
+def _extract_bible_blocking(
+    chunk: str,
+    mapped_model: str,
+    base_url: str | None,
+    api_key: str | None,
+    target_language: str,
+) -> tuple[dict, dict]:
+    """One film-bible extraction call over a transcript window. Errors
+    collapse to ({}, {})."""
+    from app.worker.translation_prompts import build_bible_extraction_prompt
+
+    actual_model, endpoint = _resolve_translation_endpoint(mapped_model, base_url)
+    headers = _translation_headers(api_key)
+    system, user = build_bible_extraction_prompt(chunk, target_language)
+    body = {
+        "model": actual_model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"/no_think {user}"},
+        ],
+        "temperature": TRANSLATION_TEMPERATURE,
+        "max_tokens": 1024,
+    }
+    try:
+        raw, data = _post_translation_with_retries(endpoint, headers, body)
+    # bible is best-effort
+    except Exception:  # noqa: BLE001
+        return {}, {}
+    return _parse_bible_response(raw), data
+
+
+def _update_story_summary_blocking(
+    prev_summary: str,
+    recent_lines: list[str],
+    mapped_model: str,
+    base_url: str | None,
+    api_key: str | None,
+) -> str:
+    """Refresh the rolling two-sentence story summary. Failures keep the
+    previous summary."""
+    actual_model, endpoint = _resolve_translation_endpoint(mapped_model, base_url)
+    headers = _translation_headers(api_key)
+    user = (
+        "Update this running story summary of a film using the newest "
+        "dialogue. Reply with ONLY the updated summary, at most two "
+        "sentences.\n\n"
+        f"Current summary: {prev_summary or '(none yet)'}\n\n"
+        "Newest dialogue:\n" + "\n".join(recent_lines)
+    )
+    body = {
+        "model": actual_model,
+        "messages": [{"role": "user", "content": f"/no_think {user}"}],
+        "temperature": TRANSLATION_TEMPERATURE,
+        "max_tokens": 200,
+    }
+    try:
+        raw, _data = _post_translation_with_retries(endpoint, headers, body)
+    # summary is best-effort
+    except Exception:  # noqa: BLE001
+        return prev_summary
+    return raw.strip()[:STORY_SUMMARY_MAX_CHARS] or prev_summary
+
+
+def _transcript_chunks(joined_source: str) -> list[str]:
+    """Split a transcript into glossary-extraction windows, evenly sampling
+    when the film is too long to send every window."""
+    chunks = [
+        joined_source[i:i + GLOSSARY_CHUNK_CHARS]
+        for i in range(0, len(joined_source), GLOSSARY_CHUNK_CHARS)
+    ] or [""]
+    if len(chunks) > GLOSSARY_MAX_CHUNKS:
+        step = len(chunks) / GLOSSARY_MAX_CHUNKS
+        chunks = [chunks[int(i * step)] for i in range(GLOSSARY_MAX_CHUNKS)]
+    return chunks
+
+
+async def _extract_film_bible(
     loop,
     segments: list,
     mapped_model: str,
@@ -617,7 +1269,8 @@ async def _extract_and_log_glossary(
     api_key: str | None,
     log_path: str,
     job_id: str,
-) -> tuple[list[str], dict]:
+    target_language: str,
+) -> tuple[dict, list[dict]]:
     """One upfront call before the per-segment loop: extract proper nouns
     from the entire transcript so they can be pinned as a glossary on
     every translation call. Catches long-range consistency issues the
@@ -625,23 +1278,192 @@ async def _extract_and_log_glossary(
     cue 847. Failures are non-fatal (empty glossary = pre-glossary
     behaviour). Logging here so ``_run_translation`` stays readable.
 
-    Returns ``(glossary_list, raw_response_dict)`` so the caller can pass
-    the dict to ``extract_usage`` for token/cost accounting."""
+    The transcript is chunked (~GLOSSARY_CHUNK_CHARS per call, at most
+    GLOSSARY_MAX_CHUNKS evenly-sampled windows) so local models with small
+    context windows (stock Ollama num_ctx) see every act of the film instead
+    of silently truncating to the first 15 minutes.
+
+    Returns ``(glossary_list, [raw_response_dict, ...])`` so the caller can
+    pass each dict to ``extract_usage`` for token/cost accounting."""
     joined_source = "\n".join(
         (s.get("text") or "").strip() for s in segments if (s.get("text") or "").strip()
     )
-    glossary, gloss_data = await loop.run_in_executor(
-        None, _extract_glossary_blocking, joined_source, mapped_model, base_url, api_key,
-    )
-    if glossary:
+    bibles: list[dict] = []
+    datas: list[dict] = []
+    for chunk in _transcript_chunks(joined_source):
+        bible_part, data = await loop.run_in_executor(
+            None, _extract_bible_blocking, chunk, mapped_model, base_url, api_key,
+            target_language,
+        )
+        if bible_part:
+            bibles.append(bible_part)
+        datas.append(data)
+    bible = _merge_bibles(bibles)
+    names = bible.get("names") or []
+    if names or bible.get("characters"):
         _write_log(
             log_path, "INFO", job_id,
-            f"Glossary extracted: {len(glossary)} term(s) "
-            f"({', '.join(glossary[:10])}{'…' if len(glossary) > 10 else ''})",
+            f"Film bible extracted: {len(names)} name(s), "
+            f"{len(bible.get('characters') or [])} character(s), "
+            f"{len(bible.get('terms') or {})} pinned term(s)",
         )
     else:
-        _write_log(log_path, "INFO", job_id, "Glossary extraction returned no terms")
-    return glossary, gloss_data
+        _write_log(log_path, "INFO", job_id, "Film bible extraction returned nothing")
+    return bible, datas
+
+
+class _TranslationContext:
+    """Rolling cross-batch state: continuity pairs, recent source lines for
+    the story summary, and the summary itself."""
+
+    def __init__(self) -> None:
+        from collections import deque as _deque
+
+        from app.worker.translation_prompts import CONTEXT_WINDOW_SIZE as _N
+        self.recent_pairs = _deque(maxlen=_N)
+        self.recent_sources = _deque(maxlen=30)
+        self.story_summary = ""
+
+    def remember(self, originals: list[str], chunk: list[dict]) -> None:
+        for orig, seg in zip(originals, chunk):
+            translated = (seg.get("text") or "").strip()
+            if orig and translated:
+                self.recent_pairs.append((orig, translated))
+        self.recent_sources.extend(o for o in originals if o)
+
+
+async def _raise_if_cancelled(job_id: str, log_path: str, done: int, total: int) -> None:
+    current = await _fetch_job(job_id)
+    if current is not None and current.status == JobStatus.cancelled:
+        _write_log(log_path, "INFO", job_id,
+                   f"Cancelled mid-translation after {done}/{total} cues — stopping")
+        raise _JobCancelled()
+
+
+async def _tick_translation_progress(
+    job_id: str, redis_client: aioredis.Redis, done: int, total: int, last: int
+) -> int:
+    """Emit a progress update when the integer percentage ticks forward.
+    Linear from 65 → 80 across the segment list; stops at 79 so the
+    "Translation phase complete" emit remains the clear 80-mark."""
+    new_progress = 65 + int(14 * done / total)
+    if new_progress <= last:
+        return last
+    job = await _update_job(job_id, progress=new_progress)
+    await _publish_event(redis_client, job)
+    return new_progress
+
+
+REPAIR_MAX_CUES = 50
+
+
+def _flag_untranslated_cues(segments: list[dict], target_language: str | None,
+                            source_language: str | None) -> None:
+    """Post-loop sweep: a long cue that still reads as the SOURCE language is
+    an untranslated leftover — flag it for repair."""
+    for seg in segments:
+        if seg.get("needs_repair"):
+            continue
+        text = (seg.get("text") or "").strip()
+        if len(text) < 40:
+            continue
+        if batch_language_suspect([text], target_language, source_language):
+            seg["needs_repair"] = True
+
+
+async def _repair_pass(
+    loop,
+    segments: list[dict],
+    tgt: _TranslateTarget,
+    *,
+    acc: UsageAccumulator,
+    log_path: str,
+    job_id: str,
+) -> int:
+    """Second-pass repair of flagged cues (refusals kept as source,
+    untranslated leftovers): one stern per-cue retry each, with neighbor
+    context, bounded to REPAIR_MAX_CUES. Returns the number repaired."""
+    flagged = [i for i, seg in enumerate(segments) if seg.get("needs_repair")]
+    for i in flagged[REPAIR_MAX_CUES:]:
+        segments[i].pop("needs_repair", None)
+    if len(flagged) > REPAIR_MAX_CUES:
+        _write_log(log_path, "WARNING", job_id,
+                   f"repair pass capped: {len(flagged)} flagged, "
+                   f"repairing first {REPAIR_MAX_CUES}")
+        flagged = flagged[:REPAIR_MAX_CUES]
+    repaired = 0
+    for i in flagged:
+        seg = segments[i]
+        try:
+            translated, data = await loop.run_in_executor(
+                None,
+                lambda text=seg["text"]: _translate_segment_blocking(
+                    text, tgt.mapped_model, tgt.base_url, tgt.api_key,
+                    tgt.target_language, context_pairs=None, glossary=tgt.glossary,
+                    source_language=tgt.source_language, bible=tgt.bible,
+                ),
+            )
+        # repair is best-effort
+        except Exception:  # noqa: BLE001
+            continue
+        acc.add(extract_usage(data))
+        cleaned = _clean_single_translation(seg.get("text") or "", translated)
+        if cleaned is not None:
+            seg["text"] = cleaned
+            seg.pop("needs_repair", None)
+            repaired += 1
+    return repaired
+
+
+async def _run_batch_loop(
+    loop, tgt: _TranslateTarget, segments: list, job_id: str, log_path: str,
+    redis_client: aioredis.Redis, acc: UsageAccumulator,
+) -> None:
+    """Scene-batched translation with per-batch progress, cross-batch
+    continuity, per-batch resume checkpoints, story-summary refreshes, and a
+    per-batch cancellation check.
+
+    Translation is the longest phase by a wide margin (often 30-90 min for a
+    feature-length movie); progress maps the iteration onto the [65..80)
+    window so the Queue page never looks stuck."""
+    total = max(1, len(segments))
+    last_emitted_progress = 65
+    ctx = _TranslationContext()
+    saved_texts = _load_translation_progress(job_id)
+    if saved_texts:
+        _write_log(log_path, "INFO", job_id,
+                   f"Resuming translation — {len(saved_texts)} cue(s) already "
+                   f"translated in a previous attempt")
+    done = 0
+    offset = 0
+    for batch_no, chunk in enumerate(batch_cues_by_scene(segments)):
+        idxs = range(offset, offset + len(chunk))
+        offset += len(chunk)
+        originals = [(s.get("text") or "").strip() for s in chunk]
+        if _restore_saved_batch(saved_texts, idxs, chunk):
+            ctx.remember(originals, chunk)
+            done += len(chunk)
+            continue
+        await _raise_if_cancelled(job_id, log_path, done, total)
+        await _translate_batch(
+            loop, chunk, tgt,
+            context_pairs=list(ctx.recent_pairs),
+            story_so_far=ctx.story_summary or None,
+            acc=acc,
+        )
+        for i, seg in zip(idxs, chunk):
+            saved_texts[str(i)] = seg.get("text") or ""
+        _save_translation_progress(job_id, saved_texts)
+        ctx.remember(originals, chunk)
+        if (batch_no + 1) % STORY_SUMMARY_EVERY_N_BATCHES == 0:
+            ctx.story_summary = await loop.run_in_executor(
+                None, _update_story_summary_blocking, ctx.story_summary,
+                list(ctx.recent_sources), tgt.mapped_model, tgt.base_url, tgt.api_key,
+            )
+        done += len(chunk)
+        last_emitted_progress = await _tick_translation_progress(
+            job_id, redis_client, done, total, last_emitted_progress
+        )
 
 
 async def _run_translation(
@@ -678,57 +1500,27 @@ async def _run_translation(
 
     loop = asyncio.get_running_loop()
     acc = UsageAccumulator()
-    glossary, gloss_data = await _extract_and_log_glossary(
-        loop, segments, mapped_model, base_url, api_key, log_path, job_id
+    bible, gloss_datas = await _extract_film_bible(
+        loop, segments, mapped_model, base_url, api_key, log_path, job_id,
+        target_language,
     )
-    acc.add(extract_usage(gloss_data))
+    for gloss_data in gloss_datas:
+        acc.add(extract_usage(gloss_data))
+    tgt = _TranslateTarget(
+        provider=provider, model=model, mapped_model=mapped_model,
+        base_url=base_url, api_key=api_key, target_language=target_language,
+        source_language=job.source_language,
+        glossary=bible.get("names") or [], bible=bible,
+    )
 
-    # Translation is the longest phase by a wide margin (often 30-90 min for
-    # a feature-length movie). Without per-segment progress, the Queue page
-    # sits at 65% for the entire duration and users assume the job is stuck.
-    # We map the [0..len(segments)) iteration onto the [65..80) progress
-    # window and emit a job update whenever the integer percentage ticks
-    # forward, plus a once-every-N-segments heartbeat so even slow-moving
-    # bars confirm the worker is alive.
-    total = max(1, len(segments))
-    heartbeat_every = max(1, total // 20)  # ~20 SSE events per job, regardless of length
-    last_emitted_progress = 65
-    # Rolling window of (source, translation) pairs from the previous
-    # CONTEXT_WINDOW_SIZE cues so the model keeps character names + register
-    # consistent across the film. Per-language overlays + universal rules
-    # live in app/worker/translation_prompts.py.
-    from collections import deque
+    await _run_batch_loop(loop, tgt, segments, job_id, log_path, redis_client, acc)
 
-    from app.worker.translation_prompts import CONTEXT_WINDOW_SIZE
-
-    recent_pairs: deque[tuple[str, str]] = deque(maxlen=CONTEXT_WINDOW_SIZE)
-    for i, segment in enumerate(segments):
-        original_text = (segment.get("text") or "").strip()
-        await _translate_one_segment(
-            loop,
-            segment,
-            provider=provider,
-            model=model,
-            mapped_model=mapped_model,
-            base_url=base_url,
-            api_key=api_key,
-            target_language=target_language,
-            context_pairs=list(recent_pairs),
-            glossary=glossary,
-            acc=acc,
-        )
-        # Record the translation we just produced for the next call's context.
-        # Skip empty originals (already short-circuited in _translate_one_segment).
-        translated_text = (segment.get("text") or "").strip()
-        if original_text and translated_text:
-            recent_pairs.append((original_text, translated_text))
-        # Linear from 65 → 80 across the segment list. Stop at 79 so the
-        # "Translation phase complete" emit below remains the clear 80-mark.
-        new_progress = 65 + int(14 * (i + 1) / total)
-        if new_progress > last_emitted_progress or ((i + 1) % heartbeat_every == 0):
-            last_emitted_progress = new_progress
-            job = await _update_job(job_id, progress=new_progress)
-            await _publish_event(redis_client, job)
+    _flag_untranslated_cues(segments, target_language, job.source_language)
+    repaired = await _repair_pass(loop, segments, tgt,
+                                  acc=acc, log_path=log_path, job_id=job_id)
+    if repaired:
+        _write_log(log_path, "INFO", job_id,
+                   f"Repair pass fixed {repaired} suspect cue(s)")
 
     # Ollama is local/free (reports no cost); every other provider's cost
     # is whatever its responses reported (None if any call omitted it).
@@ -829,6 +1621,9 @@ async def _write_srt_for(
 ) -> str:
     from app.core.security import validate_nas_path, ApiError
 
+    # Normalize provider full names / ISO-639-2 codes so players map the
+    # suffix ("Movie.en.srt", never "Movie.english.srt").
+    lang = normalize_lang_code(lang)
     if not lang or "/" in lang or "\\" in lang or ".." in lang:
         raise RuntimeError(f"Invalid language code: {lang!r}")
 
@@ -955,9 +1750,143 @@ async def _handle_pipeline_failure(
         await _publish_event(redis_client, job)
         return
     error_message = str(exc)
+    _clear_job_artifacts(job_id)  # terminal: resume artifacts are dead weight
     job = await _update_job(job_id, status=JobStatus.failed, error_message=error_message)
     _write_log(log_path, "ERROR", job_id, f"Job failed: {error_message}")
     await _publish_event(redis_client, job)
+
+
+async def _maybe_snap_to_shots(
+    job: Job, job_id: str, cues: list[dict], log_path: str
+) -> list[dict]:
+    """Opt-in shot-change snapping (SUBGEN_SHOT_SNAP=1): one scene-detection
+    pass, boundaries near cuts move onto them, output invariants re-applied.
+    Translated cues inherit the snapped timing (they copy it 1:1)."""
+    if not shot_snap_enabled():
+        return cues
+    from app.worker.cue_timing import apply_invariants
+
+    loop = asyncio.get_running_loop()
+    cuts = await loop.run_in_executor(None, detect_shot_changes, job.file_path)
+    if not cuts:
+        _write_log(log_path, "INFO", job_id, "Shot snap: no cuts detected — skipping")
+        return cues
+    _write_log(log_path, "INFO", job_id,
+               f"Shot snap: aligning cue boundaries to {len(cuts)} cut(s)")
+    return apply_invariants(snap_cues_to_shots(cues, cuts))
+
+
+async def _run_vad(job_id: str, audio_path: str, log_path: str):
+    """Client-side VAD: speech regions reject hallucinated segments over
+    silence/music and feed the sync self-check. Best-effort — None means
+    "no information" and disables the rejection."""
+    if vad_disabled():
+        return None
+    loop = asyncio.get_running_loop()
+    speech_regions = await loop.run_in_executor(None, detect_speech_regions, audio_path)
+    if speech_regions is not None:
+        total = sum(e - s for s, e in speech_regions)
+        _write_log(log_path, "INFO", job_id,
+                   f"VAD: {len(speech_regions)} speech region(s), "
+                   f"{total/60:.1f} min of speech")
+        save_regions(f"{_LOG_DIR}/{job_id}.vad.json", speech_regions)
+    return speech_regions
+
+
+async def _translate_phase(
+    job: Job, job_id: str, src_cues: list[dict], log_path: str,
+    redis_client: aioredis.Redis,
+):
+    """Translate per cue on unwrapped copies (1:1, source-derived timing
+    preserved) so no source line breaks reach the model; reflow_translated
+    re-times + re-wraps. Returns the target SRT path, or the cancel result
+    dict when the job was cancelled mid-phase."""
+    translate_cues = [
+        {"start": c["start"], "end": c["end"], "text": " ".join(c["text"].splitlines())}
+        for c in src_cues
+    ]
+    translated_cues = await _translate(job, job_id, translate_cues, log_path, redis_client)
+    if (result := await _check_cancel_after(job_id, log_path, "translate")):
+        return result
+    translated_cues = reflow_translated(translated_cues)
+    return await _write_srt_for(
+        job, job_id, translated_cues, job.target_language, log_path, redis_client)
+
+
+async def _obtain_transcription(
+    job: Job, job_id: str, audio_path: str, log_path: str,
+    redis_client: aioredis.Redis,
+) -> tuple[dict | None, dict | None]:
+    """Extract + VAD + transcribe, or resume from a persisted checkpoint
+    (2026-07 audit WS9). Returns ``(transcription, cancel_result)`` — when
+    the job was cancelled mid-phase, ``cancel_result`` carries the pipeline
+    return value and ``transcription`` is None."""
+    checkpoint = _load_transcription_checkpoint(job_id)
+    if checkpoint is not None:
+        _write_log(log_path, "INFO", job_id,
+                   "Resuming from transcription checkpoint — "
+                   "skipping extraction and transcription")
+        await _update_job(job_id,
+                          source_language=checkpoint.get("language"),
+                          progress=60)
+        return checkpoint, None
+
+    await _extract_audio(job, job_id, audio_path, log_path, redis_client)
+    if (result := await _check_cancel_after(job_id, log_path, "extract")):
+        return None, result
+    speech_regions = await _run_vad(job_id, audio_path, log_path)
+    transcription = await _transcribe(job, job_id, audio_path, log_path,
+                                      redis_client, speech_regions)
+    _save_transcription_checkpoint(job_id, transcription)
+    return transcription, None
+
+
+async def _source_srt_phase(
+    job_id: str, transcription: dict, log_path: str, redis_client: aioredis.Redis,
+) -> tuple[Job, list[dict], str]:
+    """Build and write the source-language SRT: re-fetch the job (for the
+    detected source_language set by _transcribe), re-segment into
+    speech-aligned reading-speed-bounded cues, optionally snap to shot
+    changes, write atomically."""
+    job = await _fetch_job(job_id)
+    src_cues = build_source_cues(transcription)
+    src_cues = await _maybe_snap_to_shots(job, job_id, src_cues, log_path)
+    source_srt = await _write_srt_for(
+        job, job_id, src_cues, job.source_language, log_path, redis_client)
+    return job, src_cues, source_srt
+
+
+async def _complete_pipeline(
+    job_id: str, srt_path: str, log_path: str, redis_client: aioredis.Redis
+) -> dict:
+    """Terminal success path: CAS the completed status (a racing cancel wins),
+    clear resume artifacts, then the fire-and-forget tail — Jellyfin refresh
+    and best-effort verification — neither of which may fail the job."""
+    job = await _complete_job_if_processing(
+        job_id, status=JobStatus.completed, phase=JobPhase.done, progress=100,
+        completed_at=_utcnow(),
+    )
+    if job is None:
+        # A cancel won the race against the terminal write.
+        _write_log(log_path, "INFO", job_id, "Job cancelled during final write — not completing")
+        _clear_job_artifacts(job_id)
+        return {"status": JobStatus.cancelled, "srt_path": srt_path}
+    _clear_job_artifacts(job_id)
+    _write_log(log_path, "INFO", job_id, f"Job completed successfully — {srt_path}")
+    await _publish_event(redis_client, job)
+
+    # fire-and-forget Jellyfin library refresh. Never raises;
+    # failures stay out of the worker's success path.
+    await _trigger_jellyfin_refresh(job_id, log_path, redis_client)
+
+    # Post-completion verification — best-effort, never re-raises.
+    try:
+        await run_verification(job_id)
+    except Exception:  # noqa: BLE001
+        _write_log(log_path, "WARNING", job_id,
+                   "post-completion verification failed (non-fatal)")
+
+    return {"status": JobStatus.completed, "srt_path": srt_path}
 
 
 async def _async_pipeline(job_id: str) -> dict:
@@ -968,6 +1897,14 @@ async def _async_pipeline(job_id: str) -> dict:
     # If the API cancelled the job before the worker picked it up, exit cleanly.
     if job.status == JobStatus.cancelled:
         return {"status": JobStatus.cancelled, "srt_path": None}
+
+    # Idempotency guard (2026-07 audit R4): only a queued row may start the
+    # pipeline. A redelivered message for a completed/failed job (acks_late +
+    # visibility-timeout redelivery, duplicate dispatch) must be a no-op, and
+    # status=processing means another worker owns it — orphan recovery flips
+    # crashed rows back to queued before re-dispatching.
+    if job.status != JobStatus.queued:
+        return {"status": job.status, "srt_path": None}
 
     log_path = f"{_LOG_DIR}/{job_id}.log"
     os.makedirs(_LOG_DIR, exist_ok=True)
@@ -980,60 +1917,30 @@ async def _async_pipeline(job_id: str) -> dict:
 
         audio_path = f"/tmp/{job_id}.wav"
         try:
-            await _extract_audio(job, job_id, audio_path, log_path, redis_client)
-            if (result := await _check_cancel_after(job_id, log_path, "extract")):
-                return result
-            transcription = await _transcribe(job, job_id, audio_path, log_path, redis_client)
+            transcription, cancelled = await _obtain_transcription(
+                job, job_id, audio_path, log_path, redis_client)
+            if cancelled is not None:
+                return cancelled
             if (result := await _check_cancel_after(job_id, log_path, "transcribe")):
                 return result
 
-            # Re-fetch to get the detected source_language set by _transcribe.
-            job = await _fetch_job(job_id)
-            src_lang = job.source_language
-
-            # Re-segment into speech-aligned, reading-speed-bounded cues (word
-            # path when the backend gives word timestamps, else the segment-only
-            # sentence heuristic). These wrapped cues are the source SRT.
-            src_cues = build_source_cues(transcription)
-            source_srt = await _write_srt_for(job, job_id, src_cues, src_lang, log_path, redis_client)
+            job, src_cues, source_srt = await _source_srt_phase(
+                job_id, transcription, log_path, redis_client)
 
             if job.target_language:
-                # Translate per cue on unwrapped copies (1:1, source-derived
-                # timing preserved) so no source line breaks reach the model;
-                # reflow_translated re-times + re-wraps the translated text.
-                translate_cues = [
-                    {"start": c["start"], "end": c["end"], "text": " ".join(c["text"].splitlines())}
-                    for c in src_cues
-                ]
-                translated_cues = await _translate(job, job_id, translate_cues, log_path, redis_client)
-                if (result := await _check_cancel_after(job_id, log_path, "translate")):
-                    return result
-                translated_cues = reflow_translated(translated_cues)
-                target_srt = await _write_srt_for(job, job_id, translated_cues, job.target_language, log_path, redis_client)
-                srt_path = target_srt
+                srt_path = await _translate_phase(job, job_id, src_cues, log_path, redis_client)
+                if isinstance(srt_path, dict):  # cancelled mid-phase
+                    return srt_path
             else:
                 srt_path = source_srt
 
-            now = _utcnow()
-            job = await _update_job(
-                job_id, status=JobStatus.completed, phase=JobPhase.done, progress=100, completed_at=now
-            )
-            _write_log(log_path, "INFO", job_id, f"Job completed successfully — {srt_path}")
-            await _publish_event(redis_client, job)
+            return await _complete_pipeline(job_id, srt_path, log_path, redis_client)
 
-            # fire-and-forget Jellyfin library refresh. Never
-            # raises; failures stay out of the worker's success path.
-            await _trigger_jellyfin_refresh(job_id, log_path, redis_client)
-
-            # Post-completion verification — best-effort, never re-raises.
-            try:
-                await run_verification(job_id)
-            except Exception:  # noqa: BLE001
-                _write_log(log_path, "WARNING", job_id,
-                           "post-completion verification failed (non-fatal)")
-
-            return {"status": JobStatus.completed, "srt_path": srt_path}
-
+        except _JobCancelled:
+            job = await _fetch_job(job_id)
+            if job is not None:
+                await _publish_event(redis_client, job)
+            return {"status": JobStatus.cancelled, "srt_path": None}
         except Exception as exc:
             await _handle_pipeline_failure(job_id, exc, log_path, redis_client)
             raise
@@ -1139,12 +2046,33 @@ def _run_verification_verdict(job: Job) -> dict:
             with open(source_path, encoding="utf-8", errors="replace") as f:
                 source_text = f.read()
         model_cfg = _verification_model_cfg(job)
-        return _verify_subtitles(srt_text, source_srt_text=source_text,
-                                 video_duration=_probe_duration(job.file_path),
-                                 model_cfg=model_cfg)
+        result = _verify_subtitles(srt_text, source_srt_text=source_text,
+                                   video_duration=_probe_duration(job.file_path),
+                                   model_cfg=model_cfg)
+        return _append_worker_checks(result, srt_text, job)
     except Exception as e:  # best-effort: never strand the job in 'running'
         return {"status": "error", "score": 0.0,
                 "report": {"summary": f"verification error: {type(e).__name__}", "checks": []}}
+
+
+def _append_worker_checks(result: dict, srt_text: str, job: Job) -> dict:
+    """Add worker-side checks (output language, audio↔subtitle sync) to a
+    verify() result and re-aggregate. Extra report keys (e.g. metrics) are
+    preserved. These live here rather than in subtitle_verify because they
+    need worker-only dependencies (fastText model, per-job VAD data)."""
+    from app.worker.subtitle_verify import aggregate, parse_srt
+    from app.worker.sync_check import sync_check
+    from app.worker.vad import load_regions
+
+    cues = parse_srt(srt_text)
+    extra = [
+        language_check(cues, normalize_lang_code(job.target_language) or None),
+        sync_check(cues, load_regions(f"{_LOG_DIR}/{job.id}.vad.json")),
+    ]
+    checks = list(result.get("report", {}).get("checks", [])) + extra
+    agg = aggregate(checks)
+    agg["report"] = {**result.get("report", {}), **agg["report"]}
+    return agg
 
 
 async def run_verification(job_id: str) -> None:

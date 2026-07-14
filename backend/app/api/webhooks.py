@@ -96,8 +96,17 @@ async def receive_webhook(
             },
         )
 
-    body = await request.json()
-    if "file_path" not in body or not isinstance(body["file_path"], str):
+    try:
+        body = await request.json()
+    except ValueError:
+        # json.JSONDecodeError / UnicodeDecodeError (both ValueError) — the
+        # client sent a non-JSON body.
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "request body is not valid JSON",
+                     "code": "WEBHOOK_BAD_JSON"},
+        )
+    if not isinstance(body, dict) or "file_path" not in body or not isinstance(body["file_path"], str):
         await _record_missing_path(session, trigger_id, body, ip)
         return JSONResponse(
             status_code=400,

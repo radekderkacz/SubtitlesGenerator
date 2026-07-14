@@ -255,3 +255,45 @@ async def test_dispatch_match_submits_with_trigger_source():
     assert outcome == "submitted"
     assert enqueued[0].file_path == "/x/m.mkv"
     assert enqueued[0].source == "trigger:t1"
+
+
+# ---------------------------------------------------------------------------
+# WS5 (2026-07 audit): chokepoint dedup — SRT-exists + active-duplicate
+# ---------------------------------------------------------------------------
+
+def _full_action():
+    return {"profile_name": "P1", "source_language": None, "target_language": None}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skips_when_sibling_srt_exists():
+    evt = MatchEvent("t1", "/x/movie.mkv", {})
+    trig = _trig(action=_full_action())
+    session = AsyncMock(); session.add = MagicMock(); session.commit = AsyncMock()
+    with (
+        patch("app.services.trigger_executor._get_trigger", AsyncMock(return_value=trig)),
+        patch("app.services.trigger_executor.has_sibling_srt", return_value=True),
+        patch("app.services.trigger_executor.enqueue_job", new=AsyncMock()) as eq,
+    ):
+        outcome = await dispatch_event(session, evt)
+    assert outcome == "skipped_existing_srt"
+    eq.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_maps_duplicate_error_from_enqueue():
+    """The DB unique index is the backstop for check-then-act races —
+    dispatch_event must map it to the skipped_duplicate outcome, not crash."""
+    from app.services.job_service import DuplicateJobError
+    evt = MatchEvent("t1", "/x/movie.mkv", {})
+    trig = _trig(action=_full_action())
+    session = AsyncMock(); session.add = MagicMock(); session.commit = AsyncMock()
+    with (
+        patch("app.services.trigger_executor._get_trigger", AsyncMock(return_value=trig)),
+        patch("app.services.trigger_executor.has_sibling_srt", return_value=False),
+        patch("app.services.trigger_executor._profile_exists", AsyncMock(return_value=True)),
+        patch("app.services.trigger_executor.enqueue_job",
+              new=AsyncMock(side_effect=DuplicateJobError("/x/movie.mkv"))),
+    ):
+        outcome = await dispatch_event(session, evt)
+    assert outcome == "skipped_duplicate"
