@@ -142,7 +142,18 @@ function HistoryRow({ entry, onDelete }: RowProps) {
       className={`${rowClass} h-[44px] focus:outline-none focus:ring-2 focus:ring-primary/50`}
     >
       <td className="px-4 py-2 font-mono text-[13px] text-foreground truncate max-w-[300px]">
-        {basename(entry.file_path)}
+        <span className="inline-flex items-center gap-2 max-w-full">
+          <span className="truncate">{basename(entry.file_path)}</span>
+          {entry.source_srt_path && (
+            <span
+              title={`Translated from existing subtitles: ${basename(entry.source_srt_path)} — transcription skipped`}
+              aria-label={`Translated from existing subtitles: ${basename(entry.source_srt_path)}`}
+              className="shrink-0 rounded-full border border-border bg-secondary/40 px-2 py-0.5 text-[10px] font-sans font-semibold uppercase tracking-wider text-muted-foreground"
+            >
+              From SRT
+            </span>
+          )}
+        </span>
       </td>
       <td className="px-4 py-2">
         <ColorPillBadge label={status.label} cssVar={status.cssVar} ariaLabel={`Status: ${status.label}`} />

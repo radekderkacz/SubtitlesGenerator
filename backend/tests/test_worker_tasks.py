@@ -76,6 +76,8 @@ def _make_job(**kwargs):
     job.verification_score = None
     job.verification_report = None
     job.verified_at = None
+    job.source_srt_path = None
+    job.use_existing_subs = False
     for k, v in kwargs.items():
         setattr(job, k, v)
     return job

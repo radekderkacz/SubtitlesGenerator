@@ -10,6 +10,7 @@ import { useElapsedTime } from '@/hooks/useElapsedTime'
 import { useIsStaleQueued } from '@/hooks/useIsStaleQueued'
 import { basename, dirname } from '@/lib/utils'
 import { isActive, JOB_STATUS, type Job } from '@/types/api'
+import { isAutoRetryJob } from '@/lib/jobSource'
 
 type Props = Readonly<{
   job: Job
@@ -113,6 +114,13 @@ export default function JobRow({ job, selected, onSelect }: Props) {
                   label="Auto"
                   cssVar="--phase-auto"
                   ariaLabel="Source: auto-detected via watch folder"
+                />
+              )}
+              {isAutoRetryJob(job) && (
+                <ColorPillBadge
+                  label="Auto-retry"
+                  cssVar="--phase-auto"
+                  ariaLabel="Source: automatic retry after a failed verification"
                 />
               )}
             </div>

@@ -110,6 +110,8 @@ export type JobSubmitPayload = {
   source_language: string
   translate: boolean
   target_language?: string
+  /** Omitted = follow the global "prefer existing subtitles" setting. */
+  use_existing_subs?: boolean
 }
 
 export type JobSubmitResponse = {

@@ -21,6 +21,7 @@ const schema = z.object({
     .string()
     .min(1, 'Path is required')
     .regex(ALLOWED_PATH_PATTERN, ALLOWED_PATH_MESSAGE),
+  prefer_existing_subs: z.boolean(),
 })
 
 type FormValues = z.infer<typeof schema>
@@ -41,6 +42,7 @@ export default function NasPathsPane({ onDirtyChange }: Props) {
     resolver: zodResolver(schema),
     defaultValues: {
       nas_mount_path: settings?.nas_mount_path ?? '',
+      prefer_existing_subs: settings?.prefer_existing_subs ?? true,
     },
   })
 
@@ -48,6 +50,7 @@ export default function NasPathsPane({ onDirtyChange }: Props) {
     if (settings && !form.formState.isDirty) {
       form.reset({
         nas_mount_path: settings.nas_mount_path ?? '',
+        prefer_existing_subs: settings.prefer_existing_subs ?? true,
       })
     }
   }, [settings, form])
@@ -131,6 +134,27 @@ export default function NasPathsPane({ onDirtyChange }: Props) {
                 error={form.formState.errors.nas_mount_path?.message}
                 success={!isDirty && successPath === currentNasPath && successPath !== null && successPath !== ''}
                 placeholder="/media"
+              />
+            </div>
+
+            <div className="flex items-start justify-between gap-4 rounded-lg border border-border bg-secondary/20 p-4">
+              <div>
+                <label htmlFor="prefer_existing_subs" className="text-sm font-medium text-foreground">
+                  Prefer existing subtitles
+                </label>
+                <p className="text-xs text-muted-foreground mt-1">
+                  When a video ships with a subtitle track (sidecar file or embedded)
+                  that passes verification, use it as the source instead of
+                  transcribing. You can override this per job on the submit sheet.
+                </p>
+              </div>
+              <input
+                id="prefer_existing_subs"
+                type="checkbox"
+                className="h-4 w-4 mt-1 shrink-0 accent-[var(--action-accent)]"
+                checked={form.watch('prefer_existing_subs')}
+                onChange={(e) =>
+                  form.setValue('prefer_existing_subs', e.target.checked, { shouldDirty: true })}
               />
             </div>
 

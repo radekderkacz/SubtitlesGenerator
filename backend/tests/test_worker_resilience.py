@@ -145,6 +145,7 @@ def _pipeline_job():
     job.status = "queued"
     job.target_language = None
     job.source_language = None
+    job.source_srt_path = None
     return job
 
 

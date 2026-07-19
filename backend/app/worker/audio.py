@@ -59,3 +59,27 @@ def audio_filter_for(stream: dict | None) -> str | None:
     if channels >= 5 or "5.1" in layout or "7.1" in layout:
         return "pan=mono|c0=FC"
     return None
+
+
+# Frame-by-frame speech expansion (ffmpeg's canonical speech-normalization
+# parameters): faint dialogue — phone calls, whispers — is lifted toward
+# normal speech level while already-loud scenes are untouched. A single
+# global gain can't do this; it would clip the loud parts first.
+_SPEECHNORM_FILTER = "speechnorm=e=12.5:r=0.0001:l=1"
+
+
+def speech_norm_filter() -> str | None:
+    """Speech normalization for the extracted track, or None when disabled.
+
+    Runs before both VAD and Whisper, so speech detection and transcription
+    see the same lifted audio. Opt-out: SUBGEN_DISABLE_SPEECHNORM=1."""
+    if os.environ.get("SUBGEN_DISABLE_SPEECHNORM", "").lower() in ("1", "true", "yes"):
+        return None
+    return _SPEECHNORM_FILTER
+
+
+def extraction_filters(stream: dict | None) -> str | None:
+    """Full -af chain for audio extraction: optional center-channel pan then
+    speech normalization, comma-joined in filter-graph order."""
+    filters = [f for f in (audio_filter_for(stream), speech_norm_filter()) if f]
+    return ",".join(filters) if filters else None

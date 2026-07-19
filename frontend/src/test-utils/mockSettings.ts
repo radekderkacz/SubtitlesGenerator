@@ -15,6 +15,7 @@ export const baseMockSettings: Settings = {
   translation_api_url: null,
   hf_token: null,
   profiles: [],
+  prefer_existing_subs: true,
   created_at: '2024-01-01T00:00:00Z',
   updated_at: '2024-01-01T00:00:00Z',
 }

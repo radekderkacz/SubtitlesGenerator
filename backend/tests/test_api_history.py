@@ -63,6 +63,7 @@ async def test_history_list_returns_terminal_jobs_descending_with_srt_path(clien
         target_language="en",
         status="completed",
         created_at=now,
+        source_srt_path="/mnt/nas/Film.en.srt",
     )
     failed = _make_job(
         file_path="/mnt/nas/Other.mkv",
@@ -87,6 +88,9 @@ async def test_history_list_returns_terminal_jobs_descending_with_srt_path(clien
     assert len(body) == 3
     assert [r["status"] for r in body] == ["completed", "failed", "cancelled"]
     assert body[0]["srt_path"] == "/mnt/nas/Film.en.srt"
+    # provenance: this run translated from an existing SRT; the others didn't
+    assert body[0]["source_srt_path"] == "/mnt/nas/Film.en.srt"
+    assert body[1]["source_srt_path"] is None
     # AC1 includes error_message
     assert body[1]["error_message"] == "CUDA OOM"
     # cancelled with target_language gets srt_path too — only the file is gone

@@ -56,6 +56,16 @@ class Job(Base):
     cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     source: Mapped[str] = mapped_column(String, nullable=False, default="manual")
+    # When set, the pipeline starts from this SRT (parse to cues) instead of
+    # extracting audio and transcribing. Set by the auto-retry fast path
+    # (re-translate from the original run's source SRT) and by the
+    # existing-subtitles gate. Missing/unreadable file falls back to ASR.
+    source_srt_path: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # Enqueue-time resolution of settings.prefer_existing_subs (payload
+    # override wins): may the worker source cues from a verified existing
+    # subtitle track instead of transcribing?
+    use_existing_subs: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -98,6 +108,10 @@ class Settings(Base):
     # Named snapshots of the AI-backend configuration.
     # Each entry: ``{"name": str, "transcription_backend": ..., "translation_provider": ..., ...}``.
     profiles: Mapped[Optional[list]] = mapped_column(JSON, nullable=True, default=list)
+    # Prefer a verified existing subtitle track (sidecar/embedded) over
+    # transcription. Resolved onto each job at enqueue time.
+    prefer_existing_subs: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )

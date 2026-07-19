@@ -8,6 +8,7 @@ import { withApiToast } from '@/lib/apiToast'
 import { useElapsedTime } from '@/hooks/useElapsedTime'
 import { basename } from '@/lib/utils'
 import { isActive, type Job } from '@/types/api'
+import { isAutoRetryJob } from '@/lib/jobSource'
 
 type Props = Readonly<{
   job: Job
@@ -95,6 +96,9 @@ export default function ActiveJobCard({ job }: Props) {
           <span>Elapsed: <span className="font-mono text-foreground">{elapsed}</span></span>
           {job.source === 'watch_folder' && (
             <span className="text-[var(--phase-auto)] font-semibold uppercase tracking-wider">Auto</span>
+          )}
+          {isAutoRetryJob(job) && (
+            <span className="text-[var(--phase-auto)] font-semibold uppercase tracking-wider">Auto-retry</span>
           )}
         </div>
       </div>

@@ -51,6 +51,7 @@ def make_settings_row():
             translation_api_key=None,
             translation_api_url=None,
             hf_token=None,
+            prefer_existing_subs=True,
             created_at=now,
             updated_at=now,
         )

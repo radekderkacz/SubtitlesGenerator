@@ -28,6 +28,7 @@ function makeEntry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
     total_tokens: null,
     cost_usd: null,
     srt_path: '/mnt/nas/films/Foo.en.srt',
+    source_srt_path: null,
     error_message: null,
     created_at: created,
     updated_at: '2026-04-24T09:36:00Z',
@@ -155,6 +156,7 @@ describe('HistoryTable', () => {
       total_tokens: null,
       cost_usd: null,
       srt_path: null,
+      source_srt_path: null,
       error_message: null,
       created_at: '2026-05-17T00:00:00Z',
       updated_at: '2026-05-17T00:10:00Z',
@@ -175,5 +177,18 @@ describe('HistoryTable', () => {
     expect(screen.getByText('$0.0123')).toBeInTheDocument()
     expect(screen.getByText('$0.0000')).toBeInTheDocument()
     expect(screen.getByText('n/a')).toBeInTheDocument()
+  })
+})
+
+describe('provenance badge', () => {
+  it('marks rows translated from an existing SRT', () => {
+    renderWithRouter([makeEntry({ id: 'h1', source_srt_path: '/media/Film.en.srt' })])
+    const badge = screen.getByLabelText(/Translated from existing subtitles: Film\.en\.srt/)
+    expect(badge).toHaveTextContent('From SRT')
+  })
+
+  it('shows no badge for from-scratch generations', () => {
+    renderWithRouter([makeEntry({ id: 'h2', source_srt_path: null })])
+    expect(screen.queryByText('From SRT')).not.toBeInTheDocument()
   })
 })

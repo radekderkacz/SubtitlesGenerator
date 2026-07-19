@@ -44,6 +44,7 @@ const BASE_SETTINGS: Settings = {
   hf_token: null,
   watch_folders: [],
   profiles: [{ name: 'Default' }] as unknown as Settings['profiles'],
+  prefer_existing_subs: true,
   created_at: '2026-04-29T00:00:00Z',
   updated_at: '2026-04-29T00:00:00Z',
 }

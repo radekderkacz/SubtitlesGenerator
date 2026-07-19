@@ -26,6 +26,7 @@ export function makeHistoryEntry(
     total_tokens: null,
     cost_usd: null,
     srt_path: null,
+    source_srt_path: null,
     error_message: null,
     created_at: '2026-04-29T00:00:00Z',
     updated_at: '2026-04-29T00:00:00Z',

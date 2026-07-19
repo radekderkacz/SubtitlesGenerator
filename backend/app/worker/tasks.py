@@ -14,7 +14,7 @@ from app.core.config import app_settings
 from app.models.orm import Job, Settings, _utcnow
 from app.models.schemas import JobStatus, JobPhase
 from app.worker.asr_filters import filter_segments, normalize_lang_code
-from app.worker.audio import audio_filter_for, pick_audio_stream
+from app.worker.audio import extraction_filters, pick_audio_stream
 from app.worker.langid import batch_language_suspect, language_check
 from app.worker.shot_snap import detect_shot_changes, shot_snap_enabled, snap_cues_to_shots
 from app.worker.vad import detect_speech_regions, save_regions, vad_disabled
@@ -272,9 +272,9 @@ async def _extract_audio(
         inp = ffmpeg.input(str(validated_path))
         src = inp[f"a:{rel}"] if rel is not None else inp
         kwargs = {"acodec": "pcm_s16le", "ac": 1, "ar": "16000"}
-        pan = audio_filter_for(stream)
-        if pan:
-            kwargs["af"] = pan
+        af = extraction_filters(stream)
+        if af:
+            kwargs["af"] = af
         (ffmpeg.output(src, audio_path, **kwargs)
          .overwrite_output()
          .run(capture_stdout=True, capture_stderr=True))
@@ -1813,6 +1813,168 @@ async def _translate_phase(
         job, job_id, translated_cues, job.target_language, log_path, redis_client)
 
 
+# ---------------------------------------------------------------------------
+# Existing-subtitle gate: use a verified shipped subtitle track instead of ASR
+# ---------------------------------------------------------------------------
+
+_EXISTING_SUBS_MAX_CANDIDATES = 4
+
+
+def _existing_subs_enabled(job: Job) -> bool:
+    if os.environ.get("SUBGEN_DISABLE_EXISTING_SUBS", "").lower() in ("1", "true", "yes"):
+        return False
+    return bool(getattr(job, "use_existing_subs", True))
+
+
+def _candidate_cues(job: Job, job_id: str, cand) -> tuple[list[dict], str | None] | None:
+    """Read (sidecar) or extract (embedded) a candidate, parse, strip SDH.
+    Returns (cues, origin_sidecar_path) or None when unusable."""
+    from app.worker.existing_subs import extract_embedded, strip_sdh
+    from app.worker.subtitle_verify import parse_srt
+    if cand.kind == "sidecar":
+        path, origin = cand.path, cand.path
+    else:
+        path = f"{_LOG_DIR}/{job_id}.embedded{cand.stream_index}.srt"
+        origin = None
+        if not extract_embedded(job.file_path, cand.stream_index, path):
+            return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            cues = strip_sdh(parse_srt(f.read()))
+    except OSError:
+        return None
+    return (cues, origin) if cues else None
+
+
+def _candidate_language(cleaned: list[dict], cand_language: str | None,
+                        job: Job) -> str | None:
+    """The candidate's language, or None to reject it.
+
+    Detection from the text wins over the filename/container tag. A candidate
+    whose language matches neither an explicit source hint nor the target is
+    rejected — the user asked for something else."""
+    from app.worker.langid import detect_language
+    sample = " ".join(c.get("text", "") for c in cleaned[:200])
+    detected = detect_language(sample)
+    lang = (detected[0] if detected else None) or normalize_lang_code(cand_language) or None
+    if not lang:
+        return None
+    hint = job.source_language if job.source_language not in (None, "", "auto") else None
+    acceptable = {normalize_lang_code(v) for v in (hint, job.target_language) if v}
+    if acceptable and lang not in acceptable:
+        return None
+    return lang
+
+
+def _existing_subs_verdict(cleaned: list[dict], duration: float | None,
+                           speech_regions) -> str:
+    """pass/warn/fail for a candidate: full structural+heuristic battery plus
+    the VAD audio-sync check (catches subs made for a different cut). No LLM."""
+    from app.worker.subtitle_verify import aggregate
+    from app.worker.sync_check import sync_check
+    result = _verify_subtitles(_segments_to_srt(cleaned), video_duration=duration,
+                               model_cfg=None)
+    checks = list(result.get("report", {}).get("checks", []))
+    checks.append(sync_check(cleaned, speech_regions))
+    return aggregate(checks)["status"]
+
+
+def _try_existing_subs(
+    job: Job, job_id: str, log_path: str, speech_regions,
+) -> dict | None:
+    """Discovery + verification gate. Returns an existing-cues transcription
+    dict (accepted candidate) or None to proceed with ASR. Blocking (file
+    reads, ffprobe/ffmpeg) — callers run it via asyncio.to_thread."""
+    from app.worker.cue_timing import apply_invariants
+    from app.worker.existing_subs import (
+        find_sidecar_candidates, probe_embedded_candidates, rank_candidates)
+    if not _existing_subs_enabled(job):
+        return None
+    exclude = ({_output_srt_path(job.file_path, job.target_language)}
+               if job.target_language else set())
+    candidates = rank_candidates(
+        find_sidecar_candidates(job.file_path, exclude)
+        + probe_embedded_candidates(job.file_path),
+        job.source_language, job.target_language,
+    )[:_EXISTING_SUBS_MAX_CANDIDATES]
+    if not candidates:
+        return None
+    duration = _probe_duration(job.file_path)
+    for cand in candidates:
+        loaded = _candidate_cues(job, job_id, cand)
+        if loaded is None:
+            continue
+        cleaned, origin = loaded
+        lang = _candidate_language(cleaned, cand.language, job)
+        if lang is None:
+            continue
+        status = _existing_subs_verdict(cleaned, duration, speech_regions)
+        if status not in ("pass", "warn"):
+            _write_log(log_path, "INFO", job_id,
+                       f"existing subtitles rejected ({cand.describe()}): "
+                       f"verification {status}")
+            continue
+        _write_log(log_path, "INFO", job_id,
+                   f"Using existing subtitles ({cand.describe()}, {lang}, "
+                   f"verification {status}) — skipping transcription")
+        return {"language": lang, "existing_cues": apply_invariants(cleaned),
+                "origin_path": origin}
+    return None
+
+
+def _langs_equal(a: str | None, b: str | None) -> bool:
+    na, nb = normalize_lang_code(a) or None, normalize_lang_code(b) or None
+    return na is not None and na == nb
+
+
+def _load_source_srt_cues(job: Job, log_path: str) -> list[dict] | None:
+    """Cues from job.source_srt_path, or None to run the normal ASR pipeline.
+
+    Best-effort: a missing/unreadable/empty file logs a warning and falls
+    back to transcription — the fast path is an optimization, never a new
+    failure mode."""
+    path = getattr(job, "source_srt_path", None)
+    if not path:
+        return None
+    from app.worker.subtitle_verify import parse_srt
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            cues = parse_srt(f.read())
+    except OSError:
+        cues = []
+    if not cues:
+        _write_log(log_path, "WARNING", job.id,
+                   f"source SRT unusable ({path}) — falling back to transcription")
+        return None
+    _write_log(log_path, "INFO", job.id,
+               f"Starting from existing source subtitles ({len(cues)} cues) — "
+               "skipping audio extraction and transcription")
+    return cues
+
+
+async def _source_cues_stage(
+    job: Job, job_id: str, audio_path: str, log_path: str,
+    redis_client: aioredis.Redis,
+) -> tuple[Job, list[dict] | None, str | None, dict | None]:
+    """Produce the source cues: from job.source_srt_path when set (fast
+    re-translate / existing-subtitles path), else extract + transcribe.
+    Returns (job, src_cues, source_srt, cancel_result); when cancel_result
+    is not None the pipeline must return it."""
+    srt_cues = _load_source_srt_cues(job, log_path)
+    if srt_cues is not None:
+        job = await _update_job(job_id, progress=60)
+        return job, srt_cues, job.source_srt_path, None
+    transcription, cancelled = await _obtain_transcription(
+        job, job_id, audio_path, log_path, redis_client)
+    if cancelled is not None:
+        return job, None, None, cancelled
+    if (result := await _check_cancel_after(job_id, log_path, "transcribe")):
+        return job, None, None, result
+    job, src_cues, source_srt = await _source_srt_phase(
+        job_id, transcription, log_path, redis_client)
+    return job, src_cues, source_srt, None
+
+
 async def _obtain_transcription(
     job: Job, job_id: str, audio_path: str, log_path: str,
     redis_client: aioredis.Redis,
@@ -1835,10 +1997,104 @@ async def _obtain_transcription(
     if (result := await _check_cancel_after(job_id, log_path, "extract")):
         return None, result
     speech_regions = await _run_vad(job_id, audio_path, log_path)
+
+    # Existing-subtitle gate: a shipped track that passes verification
+    # (including audio-sync against the VAD regions) replaces ASR outright.
+    existing = await asyncio.to_thread(
+        _try_existing_subs, job, job_id, log_path, speech_regions)
+    if existing is not None:
+        await _update_job(job_id, source_language=existing["language"], progress=60)
+        _save_transcription_checkpoint(job_id, existing)
+        return existing, None
+
     transcription = await _transcribe(job, job_id, audio_path, log_path,
                                       redis_client, speech_regions)
+    transcription = await _second_pass_recover(
+        job, job_id, audio_path, log_path, transcription, speech_regions)
     _save_transcription_checkpoint(job_id, transcription)
     return transcription, None
+
+
+def _second_pass_enabled() -> bool:
+    return os.environ.get("SUBGEN_DISABLE_SECOND_PASS", "").lower() not in ("1", "true", "yes")
+
+
+def _recover_gap_blocking(
+    audio_path: str, gap: tuple[float, float],
+    url: str, model: str, api_key: str | None, language: str | None,
+) -> list[dict]:
+    """Extract one enhanced clip, re-transcribe it, return segments shifted
+    back onto the full-file timeline. Blocking; run in an executor. The clip
+    lives in a mkstemp-created file (unpredictable name, 0600) for the
+    duration of the call."""
+    import tempfile
+    from app.worker.second_pass import CLIP_PAD_SECONDS, ENHANCE_FILTER, offset_segments
+    import ffmpeg
+    start = max(0.0, gap[0] - CLIP_PAD_SECONDS)
+    duration = (gap[1] + CLIP_PAD_SECONDS) - start
+    fd, clip_path = tempfile.mkstemp(suffix=".wav", prefix="subgen-gap-")
+    os.close(fd)
+    (ffmpeg
+     .input(audio_path, ss=start, t=duration)
+     .output(clip_path, af=ENHANCE_FILTER, acodec="pcm_s16le", ac=1, ar="16000")
+     .overwrite_output()
+     .run(capture_stdout=True, capture_stderr=True))
+    try:
+        result = _run_transcription_remote_blocking(
+            clip_path, url, model, api_key, language_hint=language)
+    finally:
+        try:
+            os.remove(clip_path)
+        except OSError:
+            pass
+    return offset_segments(_reduce_response_segments(result.get("segments") or []), start)
+
+
+async def _second_pass_recover(
+    job: Job, job_id: str, audio_path: str, log_path: str,
+    transcription: dict, speech_regions: list[tuple[float, float]] | None,
+) -> dict:
+    """Re-attack VAD-speech spans the first pass left empty (faint dialogue:
+    phone calls, whispers) with aggressive enhancement. Best-effort: any
+    failure leaves the first-pass transcription untouched."""
+    from app.worker.second_pass import find_speech_gaps, merge_recovered
+    # A bare segment list is the defensive/legacy shape build_source_cues
+    # tolerates — nothing to enrich safely, pass it through.
+    if not _second_pass_enabled() or not isinstance(transcription, dict):
+        return transcription
+    segments = transcription.get("segments") or []
+    gaps = find_speech_gaps(speech_regions, segments)
+    if not gaps:
+        return transcription
+    b = _job_backend(job)
+    url, model = b.get("transcription_api_url") or "", b.get("transcription_model") or "large-v3"
+    if not url:
+        return transcription
+    _write_log(log_path, "INFO", job_id,
+               f"Second pass: {len(gaps)} speech region(s) without text — "
+               "re-transcribing with enhancement")
+    recovered: list[dict] = []
+    language = transcription.get("language")
+    for gap in gaps:
+        try:
+            segs = await asyncio.to_thread(
+                _recover_gap_blocking, audio_path, gap, url, model,
+                b.get("transcription_api_key"), language)
+        except Exception as e:  # noqa: BLE001
+            _write_log(log_path, "WARNING", job_id,
+                       f"second-pass clip {gap[0]:.1f}-{gap[1]:.1f}s failed "
+                       f"({type(e).__name__}) — skipping")
+            continue
+        filtered = filter_segments(segs, speech_regions=None)
+        recovered.extend(filtered.segments)
+    if not recovered:
+        _write_log(log_path, "INFO", job_id, "Second pass recovered nothing")
+        return transcription
+    merged = merge_recovered(segments, recovered)
+    _write_log(log_path, "INFO", job_id,
+               f"Second pass recovered {len(merged) - len(segments)} segment(s) "
+               f"from {len(gaps)} gap(s)")
+    return {**transcription, "segments": merged}
 
 
 async def _source_srt_phase(
@@ -1849,11 +2105,42 @@ async def _source_srt_phase(
     speech-aligned reading-speed-bounded cues, optionally snap to shot
     changes, write atomically."""
     job = await _fetch_job(job_id)
+    existing = transcription.get("existing_cues") if isinstance(transcription, dict) else None
+    if existing is not None:
+        # Human-authored cues: already well-formed, so no re-segmentation or
+        # shot-snapping. Write our canonical source SRT unless the accepted
+        # sidecar already IS that file — never rewrite the user's own copy.
+        canonical = _output_srt_path(job.file_path, job.source_language)
+        if transcription.get("origin_path") == canonical:
+            source_srt = canonical
+            await _update_job(job_id, source_srt_path=canonical)
+        else:
+            source_srt = await _write_srt_for(
+                job, job_id, existing, job.source_language, log_path, redis_client)
+            await _update_job(job_id, source_srt_path=source_srt)
+        return job, existing, source_srt
     src_cues = build_source_cues(transcription)
     src_cues = await _maybe_snap_to_shots(job, job_id, src_cues, log_path)
     source_srt = await _write_srt_for(
         job, job_id, src_cues, job.source_language, log_path, redis_client)
     return job, src_cues, source_srt
+
+
+async def _deliverable_phase(
+    job: Job, job_id: str, src_cues: list[dict], source_srt: str,
+    log_path: str, redis_client: aioredis.Redis,
+):
+    """Translate when a different target language is wanted; otherwise the
+    source SRT is the deliverable (an accepted existing track can already be
+    in the target language). Returns the SRT path, or the cancel result dict
+    when translation was cancelled mid-phase."""
+    if job.target_language and not _langs_equal(job.source_language, job.target_language):
+        return await _translate_phase(job, job_id, src_cues, log_path, redis_client)
+    if job.target_language:
+        _write_log(log_path, "INFO", job_id,
+                   "Source subtitles already in the target language — "
+                   "no translation needed")
+    return source_srt
 
 
 async def _complete_pipeline(
@@ -1879,9 +2166,11 @@ async def _complete_pipeline(
     # failures stay out of the worker's success path.
     await _trigger_jellyfin_refresh(job_id, log_path, redis_client)
 
-    # Post-completion verification — best-effort, never re-raises.
+    # Post-completion verification — best-effort, never re-raises. Only this
+    # fresh-generation path may trigger the free auto-retry; a manual
+    # re-verify (verify_subtitles task) never does.
     try:
-        await run_verification(job_id)
+        await run_verification(job_id, allow_auto_retry=True)
     except Exception:  # noqa: BLE001
         _write_log(log_path, "WARNING", job_id,
                    "post-completion verification failed (non-fatal)")
@@ -1917,22 +2206,15 @@ async def _async_pipeline(job_id: str) -> dict:
 
         audio_path = f"/tmp/{job_id}.wav"
         try:
-            transcription, cancelled = await _obtain_transcription(
+            job, src_cues, source_srt, cancelled = await _source_cues_stage(
                 job, job_id, audio_path, log_path, redis_client)
             if cancelled is not None:
                 return cancelled
-            if (result := await _check_cancel_after(job_id, log_path, "transcribe")):
-                return result
 
-            job, src_cues, source_srt = await _source_srt_phase(
-                job_id, transcription, log_path, redis_client)
-
-            if job.target_language:
-                srt_path = await _translate_phase(job, job_id, src_cues, log_path, redis_client)
-                if isinstance(srt_path, dict):  # cancelled mid-phase
-                    return srt_path
-            else:
-                srt_path = source_srt
+            srt_path = await _deliverable_phase(
+                job, job_id, src_cues, source_srt, log_path, redis_client)
+            if isinstance(srt_path, dict):  # cancelled mid-phase
+                return srt_path
 
             return await _complete_pipeline(job_id, srt_path, log_path, redis_client)
 
@@ -2075,8 +2357,11 @@ def _append_worker_checks(result: dict, srt_text: str, job: Job) -> dict:
     return agg
 
 
-async def run_verification(job_id: str) -> None:
-    """Async orchestration: fetch job → set running → verify → persist → publish."""
+async def run_verification(job_id: str, allow_auto_retry: bool = False) -> None:
+    """Async orchestration: fetch job → set running → verify → persist → publish.
+
+    ``allow_auto_retry`` is True only on the fresh-generation path
+    (_complete_pipeline); a hard fail there may queue one free regeneration."""
     job = await _fetch_job(job_id)
     if job is None:
         return
@@ -2093,6 +2378,73 @@ async def run_verification(job_id: str) -> None:
         verified_at=_utcnow(),
     )
     await _publish_job_update_safe(job)
+    if allow_auto_retry and verdict["status"] == "fail":
+        await _maybe_auto_retry(job)
+
+
+# Fail-severity checks that implicate ONLY the translation stage. When every
+# hard fail is in this set, the transcription was good and the retry can
+# re-translate from the on-disk source SRT instead of re-running ASR.
+_TRANSLATION_ONLY_FAILS = {"output_language", "alignment", "llm_coherence"}
+
+
+def _fast_retry_srt(job: Job) -> str | None:
+    """Source SRT path for a translation-only re-run, or None for a full one."""
+    if not (job.target_language and job.source_language):
+        return None
+    checks = (job.verification_report or {}).get("checks", [])
+    fails = {c.get("name") for c in checks if c.get("severity") == "fail"}
+    if not fails or not fails <= _TRANSLATION_ONLY_FAILS:
+        return None
+    path = _output_srt_path(job.file_path, job.source_language)
+    return path if os.path.exists(path) else None
+
+
+async def _maybe_auto_retry(job: Job) -> None:
+    """Queue one cost-free regeneration after a hard verification fail.
+
+    Best-effort by contract: eligibility (cost gate, lineage cap, kill switch)
+    lives in auto_retry.should_auto_retry; regenerate_job's ALREADY_ACTIVE
+    guard makes a concurrent manual retry win quietly; any other failure is
+    logged and swallowed — the job stays flagged exactly as before."""
+    from app.worker.auto_retry import AUTO_RETRY_SOURCE_PREFIX, should_auto_retry
+    if not should_auto_retry(job):
+        return
+    log_path = f"{_LOG_DIR}/{job.id}.log"
+    from app.core.database import AsyncSessionLocal
+    from app.services.job_service import RegenerateError, regenerate_job
+    fast_srt = _fast_retry_srt(job)
+    if fast_srt:
+        # Translation-only fail: re-translate from the original's source SRT.
+        retry_kwargs = {"source_srt_path": fast_srt}
+    else:
+        # Full re-run: clear any SRT source AND the existing-subs gate, so a
+        # bad shipped track (or bad prior transcription) can't be re-picked —
+        # the retry must genuinely re-transcribe.
+        retry_kwargs = {"source_srt_path": None, "use_existing_subs": False}
+    try:
+        async with AsyncSessionLocal() as session:
+            new_job = await regenerate_job(
+                session, job.id, source=f"{AUTO_RETRY_SOURCE_PREFIX}{job.id}",
+                **retry_kwargs)
+    except RegenerateError as e:
+        _write_log(log_path, "INFO", job.id, f"auto-retry skipped: {e.code}")
+        return
+    except Exception:  # noqa: BLE001
+        _write_log(log_path, "WARNING", job.id,
+                   "auto-retry failed to queue (non-fatal)")
+        return
+    generate_subtitles.delay(new_job.id)
+    await _publish_job_update_safe(new_job)
+    # Link the retry on the original's report so the UI can say "a free
+    # automatic retry was started" instead of leaving a silent dead end.
+    report = {**(job.verification_report or {}), "auto_retry_job_id": new_job.id}
+    updated = await _update_job(job.id, verification_report=report)
+    await _publish_job_update_safe(updated)
+    mode = "re-translate from source SRT" if fast_srt else "full re-run"
+    _write_log(log_path, "INFO", job.id,
+               f"verification failed on a cost-free profile — queued automatic retry "
+               f"{new_job.id} ({mode})")
 
 
 @celery_app.task(name="verify_subtitles")

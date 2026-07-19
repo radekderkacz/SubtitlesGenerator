@@ -86,6 +86,23 @@ describe('NasPathsPane', () => {
     })
   })
 
+  it('saves the prefer-existing-subs toggle in the PUT body', async () => {
+    vi.mocked(apiFetch)
+      .mockResolvedValueOnce({ ...baseMockSettings, prefer_existing_subs: true })
+      .mockResolvedValueOnce({ status: 'ok' })
+    renderPane()
+    const toggle = await screen.findByLabelText(/prefer existing subtitles/i)
+    expect(toggle).toBeChecked()
+    await userEvent.click(toggle)
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => {
+      const put = vi.mocked(apiFetch).mock.calls.find(
+        ([, opts]) => (opts as RequestInit | undefined)?.method === 'PUT')
+      expect(put).toBeDefined()
+      expect(JSON.parse((put![1] as RequestInit).body as string).prefer_existing_subs).toBe(false)
+    })
+  })
+
   it('shows "Settings saved" toast on successful save', async () => {
     vi.mocked(apiFetch)
       .mockResolvedValueOnce({ ...baseMockSettings, nas_mount_path: '/mnt/nas' })

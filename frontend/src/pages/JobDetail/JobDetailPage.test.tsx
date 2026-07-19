@@ -127,6 +127,50 @@ describe('JobDetailPage', () => {
     expect(screen.getByRole('button', { name: /re-verify/i })).toBeInTheDocument()
   })
 
+  it('links to the automatic retry when the report carries auto_retry_job_id', async () => {
+    vi.mocked(getJob).mockResolvedValue(
+      makeJob({
+        id: 'abc-123',
+        status: 'completed',
+        verification_status: 'fail',
+        verification_score: 20,
+        verification_report: {
+          summary: 'FAIL — 1 fail',
+          checks: [{ layer: 'structural', name: 'min_cues', severity: 'fail', detail: 'only 2 cues' }],
+          auto_retry_job_id: 'retry-456',
+        },
+      }),
+    )
+    vi.mocked(getJobLog).mockResolvedValue('')
+    vi.mocked(reverifyJob).mockResolvedValue(undefined)
+    renderJobDetail('abc-123')
+
+    expect(await screen.findByText(/fresh attempt was started automatically/)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /view the retry/i })).toHaveAttribute('href', '/jobs/retry-456')
+  })
+
+  it('shows existing-subtitles provenance when source_srt_path is set', async () => {
+    vi.mocked(getJob).mockResolvedValue(
+      makeJob({ id: 'j-es', status: 'completed', source_srt_path: '/media/Film.en.srt' }),
+    )
+    vi.mocked(getJobLog).mockResolvedValue('')
+    renderJobDetail('j-es')
+
+    expect(await screen.findByText(/Sourced from an existing subtitle track/)).toBeInTheDocument()
+    expect(screen.getByText('Film.en.srt')).toBeInTheDocument()
+  })
+
+  it('shows provenance back to the original job on an auto-regen run', async () => {
+    vi.mocked(getJob).mockResolvedValue(
+      makeJob({ id: 'retry-456', status: 'processing', source: 'auto-regen:abc-123' }),
+    )
+    vi.mocked(getJobLog).mockResolvedValue('')
+    renderJobDetail('retry-456')
+
+    expect(await screen.findByText(/Automatic retry of a run/)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /view the original job/i })).toHaveAttribute('href', '/jobs/abc-123')
+  })
+
   it('renders plain-language issues and collapses the rest', async () => {
     vi.mocked(getJob).mockResolvedValue(
       makeJob({

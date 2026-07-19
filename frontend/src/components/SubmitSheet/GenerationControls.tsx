@@ -12,6 +12,9 @@ export type GenerationControlsValues = Readonly<{
   translate: boolean
   targetLanguage: string
   profileName: string
+  /** null = untouched → omit from the payload and let the backend apply
+   *  the global "prefer existing subtitles" setting. */
+  useExistingSubs: boolean | null
 }>
 
 export const INITIAL_GENERATION_VALUES: GenerationControlsValues = {
@@ -19,6 +22,7 @@ export const INITIAL_GENERATION_VALUES: GenerationControlsValues = {
   translate: false,
   targetLanguage: '',
   profileName: '',
+  useExistingSubs: null,
 }
 
 /** Single source of truth for the submit-disable rule, mirroring the
@@ -48,6 +52,9 @@ export function buildJobPayload(
   if (v.translate && v.targetLanguage && v.targetLanguage !== AUTO_DETECT.code) {
     payload.target_language = v.targetLanguage
   }
+  if (v.useExistingSubs !== null) {
+    payload.use_existing_subs = v.useExistingSubs
+  }
   return payload
 }
 
@@ -66,12 +73,17 @@ type Props = Readonly<{
   values: GenerationControlsValues
   profiles: ReadonlyArray<{ name: string }>
   onChange: (patch: Partial<GenerationControlsValues>) => void
+  /** Global settings.prefer_existing_subs — what the switch shows until the
+   *  user touches it. Defaults to true (the backend default). */
+  existingSubsDefault?: boolean
   /** Called when the user clicks the "create one in Settings" link
    *  (SubmitSheet uses it to close its sheet). Optional. */
   onProfileLinkClick?: () => void
 }>
 
-export function GenerationControls({ idPrefix, values, profiles, onChange, onProfileLinkClick }: Props) {
+export function GenerationControls({
+  idPrefix, values, profiles, onChange, existingSubsDefault = true, onProfileLinkClick,
+}: Props) {
   const blocked = controlsBlockedReason(values, profiles.length)
   const showTargetHint =
     values.translate && (!values.targetLanguage || values.targetLanguage === AUTO_DETECT.code)
@@ -110,6 +122,22 @@ export function GenerationControls({ idPrefix, values, profiles, onChange, onPro
           )}
         </div>
       )}
+      <div className="py-2 border-t border-border pt-4 space-y-1.5">
+        <div className="flex items-center justify-between">
+          <Label htmlFor={`${idPrefix}-existing-subs-toggle`} className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Use Existing Subtitles
+          </Label>
+          <Switch
+            id={`${idPrefix}-existing-subs-toggle`}
+            checked={values.useExistingSubs ?? existingSubsDefault}
+            onCheckedChange={(checked) => onChange({ useExistingSubs: checked })}
+          />
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          If the video ships with a subtitle track that passes verification,
+          use it instead of transcribing — faster and usually more accurate.
+        </p>
+      </div>
       <div className="space-y-2">
         <Label htmlFor={`${idPrefix}-profile-trigger`} className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
           AI Profile

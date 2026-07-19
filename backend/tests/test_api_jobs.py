@@ -44,6 +44,7 @@ def _make_job(**kwargs):
         log_path=None,
         error_message=None,
         source="manual",
+        use_existing_subs=True,
         created_at=now,
         updated_at=now,
         completed_at=None,

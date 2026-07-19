@@ -85,6 +85,11 @@ async def enqueue_job(
         target_language=payload.target_language if payload.translate else None,
         backend_profile=snapshot,
         source=payload.source or "manual",
+        # Per-job override wins; else the global toggle, resolved NOW so a
+        # later settings flip can't change a queued job's behavior.
+        use_existing_subs=(payload.use_existing_subs
+                           if payload.use_existing_subs is not None
+                           else settings_row.prefer_existing_subs),
         status=JobStatus.queued,
         created_at=now,
         updated_at=now,
@@ -151,7 +156,16 @@ class RetryError(Exception):
 STUCK_QUEUED_THRESHOLD_SECONDS = 1200
 
 
-async def _clone_and_queue(session: AsyncSession, original: Job) -> Job:
+# Sentinel: "keep the original job's value" for clone overrides, so callers
+# can distinguish "inherit" from an explicit None/False (the worker's full
+# re-run retry must CLEAR source_srt_path and disable the existing-subs gate).
+_INHERIT: object = object()
+
+
+async def _clone_and_queue(
+    session: AsyncSession, original: Job, source: str = "manual",
+    source_srt_path=_INHERIT, use_existing_subs=_INHERIT,
+) -> Job:
     """Create a fresh queued Job copying the original's file + settings snapshot.
     ``backend_profile`` is the single source of truth for the worker, so the new
     run is identical to the original's configuration."""
@@ -162,7 +176,11 @@ async def _clone_and_queue(session: AsyncSession, original: Job) -> Job:
         source_language=original.source_language,
         target_language=original.target_language,
         backend_profile=original.backend_profile,
-        source="manual",
+        source=source,
+        source_srt_path=(original.source_srt_path if source_srt_path is _INHERIT
+                         else source_srt_path),
+        use_existing_subs=(original.use_existing_subs if use_existing_subs is _INHERIT
+                           else use_existing_subs),
         status=JobStatus.queued,
         created_at=now,
         updated_at=now,
@@ -228,10 +246,14 @@ class RegenerateError(Exception):
         self.code = code
 
 
-async def regenerate_job(session: AsyncSession, original_id: str) -> Job:
+async def regenerate_job(
+    session: AsyncSession, original_id: str, source: str = "manual",
+    source_srt_path=_INHERIT, use_existing_subs=_INHERIT,
+) -> Job:
     """Re-queue a terminal job's file using its original settings snapshot.
     Refuses non-terminal source jobs and duplicates (an active job already exists
-    for the same file)."""
+    for the same file). ``source`` tags the clone's provenance — the worker's
+    auto-retry passes "auto-regen:<original-id>" so the chain caps at one."""
     original = await session.get(Job, original_id)
     if original is None:
         raise RegenerateError("JOB_NOT_FOUND", "Job not found")
@@ -242,7 +264,9 @@ async def regenerate_job(session: AsyncSession, original_id: str) -> Job:
         )
     if await _has_active_job_for_path(session, original.file_path):
         raise RegenerateError("ALREADY_ACTIVE", "A job for this file is already in the queue")
-    return await _clone_and_queue(session, original)
+    return await _clone_and_queue(
+        session, original, source=source, source_srt_path=source_srt_path,
+        use_existing_subs=use_existing_subs)
 
 
 async def list_history(

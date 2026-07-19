@@ -41,6 +41,15 @@ export const JOB_PHASE = {
 
 export type JobPhase = (typeof JOB_PHASE)[keyof typeof JOB_PHASE]
 
+export type VerificationReport = {
+  summary: string
+  checks: Array<{ layer: string; name: string; severity: string; detail: string; repeated?: { text: string; start: number; end: number; count: number } }>
+  metrics?: VerificationMetrics | null
+  // Set on the original job when a hard fail on a cost-free profile queued
+  // one automatic regeneration — links the UI to the retry job.
+  auto_retry_job_id?: string | null
+}
+
 export type Job = {
   id: string
   status: JobStatus
@@ -55,13 +64,15 @@ export type Job = {
   log_path: string | null
   error_message: string | null
   source: string
+  source_srt_path: string | null
+  use_existing_subs: boolean
   created_at: string
   updated_at: string
   completed_at: string | null
   jellyfin_refreshed_at: string | null
   verification_status: VerificationStatus | null
   verification_score: number | null
-  verification_report: { summary: string; checks: Array<{ layer: string; name: string; severity: string; detail: string; repeated?: { text: string; start: number; end: number; count: number } }>; metrics?: VerificationMetrics | null } | null
+  verification_report: VerificationReport | null
   verified_at: string | null
 }
 
@@ -76,7 +87,7 @@ export type JobUpdatePayload = Pick<
   // Verification fields — present on verification events, absent on others.
   verification_status?: VerificationStatus | null
   verification_score?: number | null
-  verification_report?: { summary: string; checks: Array<{ layer: string; name: string; severity: string; detail: string; repeated?: { text: string; start: number; end: number; count: number } }>; metrics?: VerificationMetrics | null } | null
+  verification_report?: VerificationReport | null
   verified_at?: string | null
 }
 
@@ -101,6 +112,8 @@ export type Settings = {
   watch_folders: string[] | null
   /** named snapshots of the AI-backend configuration. */
   profiles: BackendProfile[] | null
+  /** Prefer a verified existing subtitle track over transcription. */
+  prefer_existing_subs: boolean
   created_at: string
   updated_at: string
 }
@@ -148,6 +161,9 @@ export type HistoryEntry = {
   total_tokens: number | null
   cost_usd: number | null
   srt_path: string | null
+  /** Set when the run started from an existing SRT (existing-subtitles gate
+   *  or fast re-translate retry) instead of transcribing from scratch. */
+  source_srt_path: string | null
   error_message: string | null
   created_at: string
   updated_at: string

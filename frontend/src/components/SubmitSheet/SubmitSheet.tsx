@@ -115,6 +115,7 @@ export default function SubmitSheet({
               idPrefix="ss"
               values={values}
               profiles={profiles}
+              existingSubsDefault={settingsQuery.data?.prefer_existing_subs ?? true}
               onChange={onChange}
               onProfileLinkClick={() => onOpenChange(false)}
             />

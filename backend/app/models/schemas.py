@@ -31,6 +31,9 @@ class JobCreate(BaseModel):
     translate: bool = False
     target_language: Optional[str] = None
     source: Optional[str] = "manual"
+    # None = follow the global settings.prefer_existing_subs toggle;
+    # an explicit bool overrides it for this job only.
+    use_existing_subs: Optional[bool] = None
 
     @model_validator(mode="after")
     def _validate(self) -> "JobCreate":
@@ -84,6 +87,8 @@ class JobResponse(BaseModel):
     log_path: Optional[str] = None
     error_message: Optional[str] = None
     source: str = "manual"
+    source_srt_path: Optional[str] = None
+    use_existing_subs: bool = True
     created_at: datetime
     updated_at: datetime
     completed_at: Optional[datetime] = None
@@ -126,6 +131,9 @@ class HistoryResponse(BaseModel):
     total_tokens: Optional[int] = None
     cost_usd: Optional[float] = None
     srt_path: Optional[str] = None
+    # Set when the run started from an existing SRT (existing-subtitles gate
+    # or fast re-translate retry) instead of transcribing from scratch.
+    source_srt_path: Optional[str] = None
     error_message: Optional[str] = None
     verification_status: Optional[str] = None
     verification_score: Optional[float] = None
@@ -155,6 +163,7 @@ class SettingsUpdate(BaseModel):
     hf_token: Optional[str] = None
     # list of named AI-backend snapshots
     profiles: Optional[list] = None
+    prefer_existing_subs: Optional[bool] = None
 
 
 class SettingsResponse(BaseModel):
@@ -174,6 +183,7 @@ class SettingsResponse(BaseModel):
     hf_token: Optional[str] = None
     # list of named AI-backend snapshots
     profiles: Optional[list] = None
+    prefer_existing_subs: bool = True
     created_at: datetime
     updated_at: datetime
 

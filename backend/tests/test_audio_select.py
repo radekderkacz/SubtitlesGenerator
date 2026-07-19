@@ -59,3 +59,43 @@ def test_center_channel_filter_only_when_opted_in(monkeypatch):
     monkeypatch.setenv("SUBGEN_CENTER_CHANNEL", "1")
     assert audio_filter_for(surround) == "pan=mono|c0=FC"
     assert audio_filter_for(stereo) is None              # stereo never pans
+
+
+# ---------------------------------------------------------------------------
+# Speech normalization (faint-dialogue rescue) — extraction filter chain
+# ---------------------------------------------------------------------------
+
+def test_speech_norm_on_by_default(monkeypatch):
+    monkeypatch.delenv("SUBGEN_DISABLE_SPEECHNORM", raising=False)
+    from app.worker.audio import speech_norm_filter
+    assert speech_norm_filter() == "speechnorm=e=12.5:r=0.0001:l=1"
+
+
+def test_speech_norm_opt_out(monkeypatch):
+    monkeypatch.setenv("SUBGEN_DISABLE_SPEECHNORM", "1")
+    from app.worker.audio import speech_norm_filter
+    assert speech_norm_filter() is None
+
+
+def test_extraction_filters_norm_only_for_stereo(monkeypatch):
+    monkeypatch.delenv("SUBGEN_DISABLE_SPEECHNORM", raising=False)
+    monkeypatch.delenv("SUBGEN_CENTER_CHANNEL", raising=False)
+    from app.worker.audio import extraction_filters
+    stereo = {"channels": 2, "channel_layout": "stereo"}
+    assert extraction_filters(stereo) == "speechnorm=e=12.5:r=0.0001:l=1"
+
+
+def test_extraction_filters_pan_then_norm(monkeypatch):
+    monkeypatch.setenv("SUBGEN_CENTER_CHANNEL", "1")
+    monkeypatch.delenv("SUBGEN_DISABLE_SPEECHNORM", raising=False)
+    from app.worker.audio import extraction_filters
+    surround = {"channels": 6, "channel_layout": "5.1"}
+    # Pan must run first so normalization applies to the isolated dialogue channel.
+    assert extraction_filters(surround) == "pan=mono|c0=FC,speechnorm=e=12.5:r=0.0001:l=1"
+
+
+def test_extraction_filters_none_when_all_disabled(monkeypatch):
+    monkeypatch.setenv("SUBGEN_DISABLE_SPEECHNORM", "1")
+    monkeypatch.delenv("SUBGEN_CENTER_CHANNEL", raising=False)
+    from app.worker.audio import extraction_filters
+    assert extraction_filters({"channels": 2, "channel_layout": "stereo"}) is None

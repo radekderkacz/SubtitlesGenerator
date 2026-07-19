@@ -39,6 +39,7 @@ function makeEntry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
     total_tokens: null,
     cost_usd: null,
     srt_path: '/mnt/nas/films/Foo.en.srt',
+    source_srt_path: null,
     error_message: null,
     created_at: '2026-04-24T09:14:00Z',
     updated_at: '2026-04-24T09:36:00Z',

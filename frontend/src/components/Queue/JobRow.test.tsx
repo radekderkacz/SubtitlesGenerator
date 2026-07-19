@@ -87,6 +87,25 @@ describe('JobRow', () => {
     expect(screen.queryByText('Auto')).not.toBeInTheDocument()
   })
 
+  it('renders a partial SSE-announced job (undefined source) without crashing', () => {
+    // jobStore.applyJobUpdate inserts unknown-ID updates as partial rows:
+    // every field outside the payload — including source — is undefined
+    // until the next queue_state replay. Rendering that window crashed
+    // prod on 2026-07-15 ("cannot read properties of undefined").
+    const partial = makeJob({})
+    // @ts-expect-error — simulating the store's documented partial-row cast
+    partial.source = undefined
+    render(<JobRow job={partial} selected={false} onSelect={() => {}} />)
+    expect(screen.queryByText('Auto-retry')).not.toBeInTheDocument()
+  })
+
+  it('renders an Auto-retry badge for auto-regen jobs', () => {
+    render(
+      <JobRow job={makeJob({ source: 'auto-regen:orig-1' })} selected={false} onSelect={() => {}} />,
+    )
+    expect(screen.getByLabelText(/Source: automatic retry/)).toHaveTextContent('Auto-retry')
+  })
+
   it('renders a progressbar reflecting the current progress value', () => {
     render(
       <JobRow

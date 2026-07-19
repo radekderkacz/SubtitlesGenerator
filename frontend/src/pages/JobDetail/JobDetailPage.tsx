@@ -13,6 +13,7 @@ import { withApiToast } from '@/lib/apiToast'
 import { verdictHeadline, issueCopy, formatClock, type IssueCopy } from '@/lib/verificationCopy'
 import { basename, formatDuration } from '@/lib/utils'
 import type { Job } from '@/types/api'
+import { isAutoRetryJob, autoRetryOriginalId } from '@/lib/jobSource'
 
 type Props = Readonly<Record<string, never>>
 
@@ -94,8 +95,8 @@ type MetricTile = Readonly<{ label: string; value: string; unit?: string; alert?
 
 function metricTiles(m: NonNullable<NonNullable<Job['verification_report']>['metrics']>): MetricTile[] {
   const tiles: MetricTile[] = [
-    { label: 'Reading speed p95', value: `${m.cps_p95}`, unit: 'cps', alert: m.cps_p95 > 20 },
-    { label: 'Fast cues >20cps', value: `${m.pct_cues_over_20cps}`, unit: '%', alert: m.pct_cues_over_20cps > 5 },
+    { label: 'Read speed p95', value: `${m.cps_p95}`, unit: 'cps', alert: m.cps_p95 > 20 },
+    { label: 'Fast cues', value: `${m.pct_cues_over_20cps}`, unit: '%', alert: m.pct_cues_over_20cps > 5 },
     { label: 'Cues', value: m.cue_count.toLocaleString() },
     { label: 'Shortest cue', value: m.min_duration.toFixed(2), unit: 's', alert: m.min_duration < 0.5 },
   ]
@@ -115,19 +116,26 @@ function metricTiles(m: NonNullable<NonNullable<Job['verification_report']>['met
 
 type ScorecardProps = Readonly<{ metrics: NonNullable<NonNullable<Job['verification_report']>['metrics']> }>
 
-// Tile idiom: lowered tile surface inside the card, bold widest-tracked
-// micro-label, large mono value with the unit as a small muted suffix.
+// Tile idiom: lowered tile surface inside the card, bold tracked micro-label,
+// mono value with the unit as a small muted suffix. The grid sizes itself by
+// CONTAINER width (auto-fit/minmax) — viewport breakpoints crammed six
+// one-letter tiles into the panel's narrow column (bug report 2026-07-14).
 function QualityScorecard({ metrics }: ScorecardProps) {
   const tiles = metricTiles(metrics)
   if (tiles.length === 0) return null
   return (
-    <div data-testid="quality-scorecard" className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-4">
+    <div
+      data-testid="quality-scorecard"
+      className="grid grid-cols-[repeat(auto-fit,minmax(7.5rem,1fr))] gap-2 mb-4"
+    >
       {tiles.map((t) => (
-        <div key={t.label} className="bg-background/60 border border-border/50 rounded-lg p-3">
-          <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground truncate mb-1" title={t.label}>
+        <div key={t.label} className="bg-background/60 border border-border/50 rounded-lg px-2.5 py-2">
+          <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground leading-tight mb-1">
             {t.label}
           </p>
-          <p className={`text-lg leading-tight font-mono tabular-nums ${t.alert ? 'text-amber-400' : 'text-foreground'}`}>
+          <p
+            className={`text-base leading-tight font-mono tabular-nums whitespace-nowrap ${t.alert ? 'text-amber-400' : 'text-foreground'}`}
+          >
             {t.value}
             {t.unit && <span className="text-xs font-normal text-muted-foreground"> {t.unit}</span>}
           </p>
@@ -180,6 +188,18 @@ function VerificationPanel({ job }: VerificationPanelProps) {
 
       {headline.summary && (
         <p className="text-sm text-foreground/80 mb-4">{headline.summary}</p>
+      )}
+
+      {job.verification_report?.auto_retry_job_id && (
+        <p className="text-sm text-foreground/80 bg-secondary/50 border border-border rounded px-3 py-2 mb-4">
+          Your setup runs locally at no cost, so a fresh attempt was started automatically.{' '}
+          <Link
+            to={`/jobs/${job.verification_report.auto_retry_job_id}`}
+            className="text-[var(--action-accent)] hover:underline font-medium"
+          >
+            View the retry
+          </Link>
+        </p>
       )}
 
       {issues.length > 0 && (
@@ -309,6 +329,23 @@ export default function JobDetailPage(_props: Props) {
           {job.file_path}
         </p>
         <p className="text-xs text-muted-foreground font-mono">ID: {job.id}</p>
+        {isAutoRetryJob(job) && (
+          <p className="text-xs text-muted-foreground">
+            Automatic retry of a run whose subtitles failed verification —{' '}
+            <Link
+              to={`/jobs/${autoRetryOriginalId(job)}`}
+              className="text-[var(--action-accent)] hover:underline"
+            >
+              view the original job
+            </Link>
+          </p>
+        )}
+        {job.source_srt_path && !isAutoRetryJob(job) && (
+          <p className="text-xs text-muted-foreground">
+            Sourced from an existing subtitle track (verified, transcription skipped):{' '}
+            <span className="font-mono">{basename(job.source_srt_path)}</span>
+          </p>
+        )}
         <dl className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground pt-2">
           <div>
             Submitted: <span className="font-mono text-foreground">{formatSubmittedAt(job.created_at)}</span>

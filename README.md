@@ -8,8 +8,11 @@ It runs as a few small Docker containers on your own machine. **No GPU required.
 
 - **Transcribes** speech in your videos into subtitles, automatically.
 - **Translates** them into another language (optional).
+- **Reuses subtitles you already have** — if the video ships with a subtitle track (a downloaded `.srt` next to the file, or one embedded in the MKV), it's checked against the actual audio first; if it's good, it gets translated directly instead of transcribing. Much faster, usually more accurate, and **History** tags those runs "From SRT" so you can always tell how a subtitle was made.
 - **Times them properly** — short, sentence-level lines that show up *when they're actually spoken*, wrapped to a comfortable length.
+- **Handles quiet dialogue** — phone calls and whispers get a volume boost before transcription, and anything still missed gets a second, enhanced attempt.
 - **Checks its own work** — every finished job gets a pass / warn / fail quality check (with a one-click re-check) so you know which subtitles are worth reviewing. It never blocks output; it's just a heads-up.
+- **Retries itself when it's free** — if a result comes out broken and your setup is fully self-hosted (no API costs), it automatically re-runs once; the two attempts link to each other so nothing happens silently. Paid setups are never re-run automatically.
 - **Runs three ways** — on demand from the web UI, automatically when a new video appears, or on a schedule.
 - **Refreshes Jellyfin** for you (optional) so new subtitles appear right away.
 
@@ -98,13 +101,30 @@ For anything else, open an issue: <https://github.com/radekderkacz/SubtitlesGene
 ## Advanced &amp; reference
 
 <details>
-<summary><b>Quality pipeline &amp; tuning flags (July 2026)</b></summary>
+<summary><b>Quality pipeline &amp; tuning flags</b></summary>
 
-Every job now runs a quality pipeline modeled on professional subtitle standards:
+Every job runs a quality pipeline modeled on professional subtitle standards.
+Everything below is on by default and needs no configuration — the flags are
+opt-outs (or opt-ins where marked) for special cases:
 
 - **Speech detection (VAD)** — the worker detects speech regions locally and rejects
   transcription segments that sit over silence/music (Whisper's classic
   "Thanks for watching!" hallucinations). Disable with `SUBGEN_DISABLE_VAD=1`.
+- **Existing subtitles first** — if the video ships with a text subtitle track
+  (sidecar `.srt` or embedded, forced tracks excluded), it is verified against
+  the actual audio (structure, coverage, language ID, sync) and — when it passes —
+  used as the translation source instead of transcribing: faster and usually more
+  accurate. If it's already in the target language, the job finishes right there.
+  Toggle globally in Settings → Media Library or per job on the submit sheet;
+  worker kill switch: `SUBGEN_DISABLE_EXISTING_SUBS=1`.
+- **Speech normalization** — faint dialogue (phone calls, whispered lines) is
+  lifted toward normal speech level frame-by-frame before speech detection and
+  transcription see the audio. Disable with `SUBGEN_DISABLE_SPEECHNORM=1`.
+- **Second-pass gap recovery** — spans where speech is detected but the first
+  transcription produced nothing (phone calls, whispers, dialogue under music)
+  are re-extracted with aggressive enhancement (stronger expansion, telephone-band
+  EQ, denoising) and re-transcribed individually; recovered lines merge back in.
+  Disable with `SUBGEN_DISABLE_SECOND_PASS=1`.
 - **Dialogue-track selection** — the audio stream is picked explicitly (your
   source-language tag wins, then the container default), so a 5.1 commentary or
   foreign dub can no longer be transcribed by accident. For surround sources,
@@ -120,6 +140,11 @@ Every job now runs a quality pipeline modeled on professional subtitle standards
 - **Verification & scorecard** — every finished job gets structural/heuristic/semantic
   checks (including output-language ID and an audio↔subtitle sync measurement) plus a
   quality scorecard (reading speed, coverage, cue stats) on the job detail page.
+- **Automatic free retry** — if verification hard-fails ("Needs attention") and the
+  job's profile is cost-free to re-run (self-hosted keyless transcription, Ollama or
+  no translation), one regeneration is queued automatically; both jobs link to each
+  other on the detail page. Paid profiles are never retried automatically — they stay
+  flagged. Disable with `SUBGEN_DISABLE_AUTO_RETRY=1`.
 
 **Bazarr integration:** point Bazarr's *whisper* provider at this app's URL —
 `POST /asr` and `POST /detect-language` speak the whisper-asr-webservice protocol and
@@ -249,11 +274,11 @@ The `app`, `worker`, and `beat` services run on `:latest` and carry `com.century
 ```yaml
 # docker-compose.yml
   app:
-    image: ghcr.io/radekderkacz/subtitles-generator-app:0.2.0
+    image: ghcr.io/radekderkacz/subtitles-generator-app:0.3.0
   worker:
-    image: ghcr.io/radekderkacz/subtitles-generator-worker:0.2.0
+    image: ghcr.io/radekderkacz/subtitles-generator-worker:0.3.0
   beat:
-    image: ghcr.io/radekderkacz/subtitles-generator-worker:0.2.0
+    image: ghcr.io/radekderkacz/subtitles-generator-worker:0.3.0
 ```
 
 Every build is also tagged with its commit SHA for even more precise pinning.

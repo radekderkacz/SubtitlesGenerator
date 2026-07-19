@@ -85,6 +85,7 @@ def _to_history_response(job: Job) -> HistoryResponse:
         total_tokens=job.total_tokens,
         cost_usd=job.cost_usd,
         srt_path=_output_srt_path(job.file_path, job.target_language),
+        source_srt_path=job.source_srt_path,
         error_message=job.error_message,
         verification_status=job.verification_status,
         verification_score=job.verification_score,

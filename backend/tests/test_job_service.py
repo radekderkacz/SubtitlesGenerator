@@ -595,7 +595,41 @@ async def test_regenerate_clones_terminal_job_with_snapshot():
     assert added.backend_profile == {"translation_model": "gemma3:27b"}
     assert added.status == JobStatus.queued
     assert added.id != "src"
+    assert added.source == "manual"
     assert new is added
+
+
+@pytest.mark.asyncio
+async def test_regenerate_full_rerun_can_clear_srt_and_existing_subs():
+    # Explicit None/False (worker's full re-run) must NOT fall back to inherit.
+    session = _regen_session(_job(source_srt_path="/media/Movie/A.en.srt"))
+    await job_service.regenerate_job(
+        session, "src", source_srt_path=None, use_existing_subs=False)
+    added = session.add.call_args.args[0]
+    assert added.source_srt_path is None
+    assert added.use_existing_subs is False
+
+
+@pytest.mark.asyncio
+async def test_regenerate_sets_and_inherits_source_srt_path():
+    # Explicit value (fast re-translate) overrides; None inherits the original's.
+    session = _regen_session(_job())
+    await job_service.regenerate_job(session, "src", source_srt_path="/media/Movie/A.en.srt")
+    assert session.add.call_args.args[0].source_srt_path == "/media/Movie/A.en.srt"
+
+    session = _regen_session(_job(source_srt_path="/media/Movie/A.en.srt"))
+    await job_service.regenerate_job(session, "src")
+    assert session.add.call_args.args[0].source_srt_path == "/media/Movie/A.en.srt"
+
+
+@pytest.mark.asyncio
+async def test_regenerate_stamps_custom_source():
+    # The worker's auto-retry passes "auto-regen:<id>" so the clone carries
+    # its provenance (and the lineage cap can stop a second auto attempt).
+    session = _regen_session(_job())
+    new = await job_service.regenerate_job(session, "src", source="auto-regen:src")
+    assert session.add.call_args.args[0].source == "auto-regen:src"
+    assert new.source == "auto-regen:src"
 
 
 @pytest.mark.asyncio
@@ -643,6 +677,22 @@ def _session_for_enqueue(profiles):
     session.refresh = AsyncMock()
     session.rollback = AsyncMock()
     return session
+
+
+@pytest.mark.asyncio
+async def test_enqueue_resolves_existing_subs_from_settings():
+    # payload None → global toggle; explicit override wins.
+    for global_pref, override, expected in (
+        (True, None, True), (False, None, False),
+        (False, True, True), (True, False, False),
+    ):
+        session = _session_for_enqueue([{"name": "P1"}])
+        settings_row = session.execute.return_value.scalar_one_or_none.return_value
+        settings_row.prefer_existing_subs = global_pref
+        payload = JobCreate(file_path="/m/x.mkv", profile_name="P1",
+                            use_existing_subs=override)
+        await job_service.enqueue_job(session, payload, dispatch=False)
+        assert session.add.call_args.args[0].use_existing_subs is expected
 
 
 @pytest.mark.asyncio

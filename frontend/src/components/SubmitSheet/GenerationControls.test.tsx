@@ -14,6 +14,7 @@ const renderInRouter = (ui: React.ReactElement) => render(<MemoryRouter>{ui}</Me
 
 const base: GenerationControlsValues = {
   sourceLanguage: 'auto', translate: false, targetLanguage: '', profileName: '',
+  useExistingSubs: null,
 }
 
 describe('controlsBlockedReason', () => {
@@ -41,11 +42,16 @@ describe('buildJobPayload', () => {
       .toEqual({ file_path: '/x.mkv', profile_name: 'p', source_language: 'auto', translate: false })
   })
   it('includes target_language only when translate + concrete target', () => {
-    expect(buildJobPayload('/x.mkv', { sourceLanguage: 'en', translate: true, targetLanguage: 'pl', profileName: 'p' }))
+    expect(buildJobPayload('/x.mkv', { ...base, sourceLanguage: 'en', translate: true, targetLanguage: 'pl', profileName: 'p' }))
       .toEqual({ file_path: '/x.mkv', profile_name: 'p', source_language: 'en', translate: true, target_language: 'pl' })
   })
+  it('omits use_existing_subs when untouched, includes explicit override', () => {
+    expect(buildJobPayload('/x.mkv', { ...base, profileName: 'p' }).use_existing_subs).toBeUndefined()
+    expect(buildJobPayload('/x.mkv', { ...base, profileName: 'p', useExistingSubs: false }).use_existing_subs).toBe(false)
+    expect(buildJobPayload('/x.mkv', { ...base, profileName: 'p', useExistingSubs: true }).use_existing_subs).toBe(true)
+  })
   it('omits target_language when translate + auto target', () => {
-    const p = buildJobPayload('/x.mkv', { sourceLanguage: 'en', translate: true, targetLanguage: 'auto', profileName: 'p' })
+    const p = buildJobPayload('/x.mkv', { ...base, sourceLanguage: 'en', translate: true, targetLanguage: 'auto', profileName: 'p' })
     expect(p.target_language).toBeUndefined()
   })
 })
@@ -75,11 +81,26 @@ describe('<GenerationControls>', () => {
   })
   it('toggling translate off clears target via onChange', async () => {
     const { onChange } = setup({ ...base, translate: true, targetLanguage: 'pl' })
-    await userEvent.click(screen.getByRole('switch'))
+    await userEvent.click(screen.getByRole('switch', { name: /translate subtitles/i }))
     expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ translate: false, targetLanguage: '' }))
   })
   it('shows the empty-state link when no profiles', () => {
     renderInRouter(<GenerationControls idPrefix="t" values={{ ...base }} profiles={[] as never} onChange={vi.fn()} onProfileLinkClick={noop} />)
     expect(screen.getByText(/create one in settings/i)).toBeInTheDocument()
+  })
+})
+
+describe('existing-subtitles switch', () => {
+  const profiles = [{ name: 'gemma' }] as never
+  it('shows the global default until touched, then reports an explicit override', async () => {
+    const onChange = vi.fn()
+    renderInRouter(
+      <GenerationControls idPrefix="t" values={{ ...base }} profiles={profiles}
+        onChange={onChange} existingSubsDefault={false} />,
+    )
+    const toggle = screen.getByRole('switch', { name: /use existing subtitles/i })
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+    await userEvent.click(toggle)
+    expect(onChange).toHaveBeenCalledWith({ useExistingSubs: true })
   })
 })
