@@ -1847,23 +1847,29 @@ def _candidate_cues(job: Job, job_id: str, cand) -> tuple[list[dict], str | None
 
 
 def _candidate_language(cleaned: list[dict], cand_language: str | None,
-                        job: Job) -> str | None:
-    """The candidate's language, or None to reject it.
+                        job: Job) -> tuple[str | None, str | None]:
+    """``(language, None)`` when acceptable, ``(None, reason)`` when rejected.
 
-    Detection from the text wins over the filename/container tag. A candidate
-    whose language matches neither an explicit source hint nor the target is
-    rejected — the user asked for something else."""
+    Detection from the text wins over the filename/container tag. With an
+    explicit source hint, a candidate matching neither the hint nor the
+    target is rejected — the user asked for something else. With source
+    "auto" any confidently-detected language is acceptable: it is a valid
+    translation source, and the verification + audio-sync gates still
+    protect against wrong-cut or garbage tracks."""
     from app.worker.langid import detect_language
     sample = " ".join(c.get("text", "") for c in cleaned[:200])
     detected = detect_language(sample)
     lang = (detected[0] if detected else None) or normalize_lang_code(cand_language) or None
     if not lang:
-        return None
+        return None, "language could not be detected"
     hint = job.source_language if job.source_language not in (None, "", "auto") else None
+    if hint is None:
+        return lang, None
     acceptable = {normalize_lang_code(v) for v in (hint, job.target_language) if v}
-    if acceptable and lang not in acceptable:
-        return None
-    return lang
+    if lang not in acceptable:
+        return None, (f"detected language '{lang}' matches neither "
+                      f"source '{hint}' nor target '{job.target_language}'")
+    return lang, None
 
 
 def _existing_subs_verdict(cleaned: list[dict], duration: float | None,
@@ -1905,8 +1911,11 @@ def _try_existing_subs(
         if loaded is None:
             continue
         cleaned, origin = loaded
-        lang = _candidate_language(cleaned, cand.language, job)
+        lang, reject_reason = _candidate_language(cleaned, cand.language, job)
         if lang is None:
+            _write_log(log_path, "INFO", job_id,
+                       f"existing subtitles skipped ({cand.describe()}): "
+                       f"{reject_reason}")
             continue
         status = _existing_subs_verdict(cleaned, duration, speech_regions)
         if status not in ("pass", "warn"):

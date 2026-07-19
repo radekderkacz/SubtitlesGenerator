@@ -194,27 +194,79 @@ def test_candidate_language_rejects_hint_mismatch(monkeypatch, tmp_path):
     monkeypatch.setattr("app.worker.langid.detect_language", lambda t, **k: ("fr", 0.99))
     job = _gate_job(tmp_path, source_language="en", target_language="pl")
     cues = [{"text": "Bonjour tout le monde, comment allez-vous?"}]
-    assert tasks._candidate_language(cues, "fr", job) is None
+    lang, reason = tasks._candidate_language(cues, "fr", job)
+    assert lang is None
+    assert "fr" in reason  # the rejection says what WAS detected
 
 
 def test_candidate_language_accepts_target_match(monkeypatch, tmp_path):
     monkeypatch.setattr("app.worker.langid.detect_language", lambda t, **k: ("pl", 0.99))
     job = _gate_job(tmp_path, source_language="en", target_language="pl")
     cues = [{"text": "Dzień dobry wszystkim, jak się macie?"}]
-    assert tasks._candidate_language(cues, None, job) == "pl"
+    assert tasks._candidate_language(cues, None, job) == ("pl", None)
 
 
 def test_candidate_language_auto_accepts_any_detected(monkeypatch, tmp_path):
     monkeypatch.setattr("app.worker.langid.detect_language", lambda t, **k: ("de", 0.99))
     job = _gate_job(tmp_path, source_language="auto", target_language=None)
     cues = [{"text": "Guten Tag, wie geht es Ihnen heute?"}]
-    assert tasks._candidate_language(cues, None, job) == "de"
+    assert tasks._candidate_language(cues, None, job) == ("de", None)
+
+
+def test_candidate_language_auto_accepts_source_lang_despite_target(monkeypatch, tmp_path):
+    # The common real-world layout: English movie + Movie.en.srt, target pl,
+    # source left at the default "auto". The en sidecar is exactly what the
+    # translation should start from — it must NOT be rejected just because
+    # en != pl. Sync + verification still gate quality.
+    monkeypatch.setattr("app.worker.langid.detect_language", lambda t, **k: ("en", 0.99))
+    job = _gate_job(tmp_path, source_language="auto", target_language="pl")
+    cues = [{"text": "Hello there, how are you doing today?"}]
+    assert tasks._candidate_language(cues, None, job) == ("en", None)
 
 
 def test_candidate_language_unknown_rejects(monkeypatch, tmp_path):
     monkeypatch.setattr("app.worker.langid.detect_language", lambda t, **k: None)
     job = _gate_job(tmp_path)
-    assert tasks._candidate_language([{"text": "??"}], None, job) is None
+    lang, reason = tasks._candidate_language([{"text": "??"}], None, job)
+    assert lang is None
+    assert reason
+
+
+def test_gate_auto_source_accepts_en_sidecar_targeting_pl(monkeypatch, tmp_path):
+    # Gate-level reproducer of the same bug: with source auto the gate must
+    # use the verified en sidecar instead of falling through to ASR.
+    (tmp_path / "Movie.mkv").touch()
+    (tmp_path / "Movie.en.srt").write_text(_SRT)
+    job = _gate_job(tmp_path)  # source auto, target pl
+    monkeypatch.setattr(tasks, "_probe_duration", lambda p: None)
+    monkeypatch.setattr(tasks, "_existing_subs_verdict", lambda c, d, r: "pass")
+    monkeypatch.setattr("app.worker.langid.detect_language", lambda t, **k: ("en", 0.99))
+    monkeypatch.setattr(tasks, "_write_log", MagicMock())
+
+    out = tasks._try_existing_subs(job, "j1", "log", None)
+    assert out is not None
+    assert out["language"] == "en"
+
+
+def test_gate_logs_language_rejection(monkeypatch, tmp_path):
+    # A candidate skipped on language must say so in the job log (verification
+    # rejections already do) — and must be rejected BEFORE the expensive
+    # verification battery runs.
+    (tmp_path / "Movie.mkv").touch()
+    (tmp_path / "Movie.srt").write_text(_SRT)
+    job = _gate_job(tmp_path, source_language="fr", target_language="pl")
+    log = MagicMock()
+    monkeypatch.setattr(tasks, "_write_log", log)
+    monkeypatch.setattr(tasks, "_probe_duration", lambda p: None)
+    monkeypatch.setattr("app.worker.langid.detect_language", lambda t, **k: ("en", 0.99))
+    verdict = MagicMock()
+    monkeypatch.setattr(tasks, "_existing_subs_verdict", verdict)
+
+    assert tasks._try_existing_subs(job, "j1", "log", None) is None
+    verdict.assert_not_called()
+    messages = " | ".join(str(c.args[3]) for c in log.call_args_list)
+    assert "skipped" in messages
+    assert "en" in messages
 
 
 # ---------------------------------------------------------------------------
