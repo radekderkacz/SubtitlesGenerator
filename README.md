@@ -8,7 +8,7 @@ It runs as a few small Docker containers on your own machine. **No GPU required.
 
 - **Transcribes** speech in your videos into subtitles, automatically.
 - **Translates** them into another language (optional).
-- **Reuses subtitles you already have** — if the video ships with a subtitle track (a downloaded `.srt` next to the file, or one embedded in the MKV), it's checked against the actual audio first; if it's good, it gets translated directly instead of transcribing. Much faster, usually more accurate, and **History** tags those runs "From SRT" so you can always tell how a subtitle was made.
+- **Reuses subtitles you already have** — if the video ships with a subtitle track (a downloaded `.srt` next to the file, or one embedded in the MKV), it's checked against the actual audio first; if it's good, it gets translated directly instead of transcribing. Much faster, usually more accurate, and **History** tags those runs "From SRT" so you can always tell how a subtitle was made. This works with the source language left on **auto** — the track's language is detected from its text, whatever it is — and when a track is passed over, the job log says exactly why.
 - **Times them properly** — short, sentence-level lines that show up *when they're actually spoken*, wrapped to a comfortable length.
 - **Handles quiet dialogue** — phone calls and whispers get a volume boost before transcription, and anything still missed gets a second, enhanced attempt.
 - **Checks its own work** — every finished job gets a pass / warn / fail quality check (with a one-click re-check) so you know which subtitles are worth reviewing. It never blocks output; it's just a heads-up.
@@ -51,6 +51,123 @@ docker compose up -d
 ```
 
 Now open **<http://localhost:8000>**. (First start pulls the images and sets up the database — give it a minute.)
+
+<details>
+<summary><b>What the compose file looks like</b> (sample — the repo's <a href="docker-compose.yml"><code>docker-compose.yml</code></a> is the fully-commented source of truth)</summary>
+
+Your `.env`:
+
+```dotenv
+# Where your videos live on THIS machine (mounted as /media in the containers)
+MEDIA_HOST_PATH=/path/to/your/videos
+# Pick your own values for these two
+DB_PASSWORD=change-me
+SECRET_KEY=change-me-too
+```
+
+And the stack it starts — five containers: the web app, a worker that runs the
+subtitle jobs, a scheduler for automations, plus Redis and Postgres:
+
+```yaml
+services:
+  app:                       # FastAPI + the web UI — open http://<host>:8000
+    image: ghcr.io/radekderkacz/subtitles-generator-app:latest
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://subtitles:${DB_PASSWORD}@db:5432/subtitles
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+    volumes:
+      - ./data/logs:/app/logs
+      - ${MEDIA_HOST_PATH}:/media:ro   # read-only: the UI only browses
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/v1/health > /dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  worker:                    # Celery worker — transcribes, translates, writes the .srt
+    image: ghcr.io/radekderkacz/subtitles-generator-worker:latest
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://subtitles:${DB_PASSWORD}@db:5432/subtitles
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    volumes:
+      - ./data/logs:/app/logs
+      - ${MEDIA_HOST_PATH}:/media      # read-write: the .srt lands next to the video
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+    stop_grace_period: 90s   # let an in-flight transcription finish or requeue
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.worker.celery_app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 10 || exit 1"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 60s
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  beat:                      # Celery beat — fires the Automations cron schedules
+    image: ghcr.io/radekderkacz/subtitles-generator-worker:latest
+    entrypoint: ["celery", "-A", "app.worker.celery_app.celery_app", "beat", "-l", "info"]
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://subtitles:${DB_PASSWORD}@db:5432/subtitles
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  redis:                     # job broker + live UI updates
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]  # queued jobs survive a restart
+    volumes:
+      - ./data/redis:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"  # infra: no auto-updates
+
+  db:                        # settings, jobs, automation triggers
+    image: postgres:17-alpine
+    environment:
+      - POSTGRES_DB=subtitles
+      - POSTGRES_USER=subtitles
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U subtitles -d subtitles"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"  # infra: no auto-updates
+```
+
+</details>
 
 ---
 
@@ -115,6 +232,11 @@ opt-outs (or opt-ins where marked) for special cases:
   the actual audio (structure, coverage, language ID, sync) and — when it passes —
   used as the translation source instead of transcribing: faster and usually more
   accurate. If it's already in the target language, the job finishes right there.
+  With the source language on **auto** (the default), a verified track in *any*
+  confidently-detected language is accepted; explicitly setting a source language
+  restricts candidates to that language (or the target). Candidates that are
+  skipped — wrong language, failed verification, out of sync — are logged with
+  the reason in the per-job log, so an ignored `.srt` is never a mystery.
   Toggle globally in Settings → Media Library or per job on the submit sheet;
   worker kill switch: `SUBGEN_DISABLE_EXISTING_SUBS=1`.
 - **Speech normalization** — faint dialogue (phone calls, whispered lines) is
